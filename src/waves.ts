@@ -12,6 +12,18 @@ export interface Airdrop {
   beacon: THREE.Mesh;
 }
 
+// Shared pod resources: one set of geometries/materials for every pod in every
+// map, so each drop allocates no GPU data and reuses already-compiled programs
+// (the pod materials' program keys match the drone shield / emissive variants
+// warmed at boot). The beacon pulse drives the shared material — every beacon
+// on the field pulses in sync, which reads as one network-wide signal.
+const podBodyGeo = new THREE.BoxGeometry(0.9, 0.9, 0.9);
+const podBodyMat = new THREE.MeshStandardMaterial({ color: 0x6a5a2e, roughness: 0.6, metalness: 0.3, emissive: new THREE.Color('#3a2b10'), emissiveIntensity: 0.4 });
+const podBandGeo = new THREE.BoxGeometry(0.95, 0.12, 0.95);
+const podBandMat = new THREE.MeshStandardMaterial({ color: 0x111, emissive: new THREE.Color('#f59e0b'), emissiveIntensity: 2 });
+const beaconGeo = new THREE.CylinderGeometry(1.1, 1.1, 24, 12, 1, true);
+const beaconMat = new THREE.MeshBasicMaterial({ color: new THREE.Color('#f59e0b'), transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: true });
+
 export class WaveDirector {
   private kindQueue: DroneKind[] = [];
   private spawnTimer = 0;
@@ -26,7 +38,20 @@ export class WaveDirector {
     private colliders: { kind: 'box' | 'cyl'; x: number; z: number; hx: number; hz: number; r: number }[],
     private waves: WaveDef[],
     private spawnAngle: () => number,
-  ) {}
+  ) {
+    // hidden template pod so the boot warm-up uploads pod geometry/textures;
+    // the first live airdrop then paints nothing new.
+    const t = new THREE.Group();
+    const body = new THREE.Mesh(podBodyGeo, podBodyMat);
+    body.position.y = 0.45;
+    const band = new THREE.Mesh(podBandGeo, podBandMat);
+    band.position.y = 0.45;
+    const beacon = new THREE.Mesh(beaconGeo, beaconMat);
+    beacon.position.y = 12;
+    t.add(body, band, beacon);
+    t.visible = false;
+    scene.add(t);
+  }
 
   reset(): void {
     this.kindQueue = [];
@@ -120,14 +145,12 @@ export class WaveDirector {
     const { x: px, z: pz } = this.findDropSite();
 
     const pod = new THREE.Group();
-    const body = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.9, 0.9), new THREE.MeshStandardMaterial({ color: 0x6a5a2e, roughness: 0.6, metalness: 0.3, emissive: new THREE.Color('#3a2b10'), emissiveIntensity: 0.4 }));
+    const body = new THREE.Mesh(podBodyGeo, podBodyMat);
     body.position.y = 0.45;
     pod.add(body);
-    const band = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.12, 0.95), new THREE.MeshStandardMaterial({ color: 0x111, emissive: new THREE.Color('#f59e0b'), emissiveIntensity: 2 }));
+    const band = new THREE.Mesh(podBandGeo, podBandMat);
     band.position.y = 0.45;
     pod.add(band);
-    const beaconGeo = new THREE.CylinderGeometry(1.1, 1.1, 24, 12, 1, true);
-    const beaconMat = new THREE.MeshBasicMaterial({ color: new THREE.Color('#f59e0b'), transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: true });
     const beacon = new THREE.Mesh(beaconGeo, beaconMat);
     beacon.position.y = 12;
     pod.add(beacon);
@@ -165,8 +188,7 @@ export class WaveDirector {
 
   private openAirdrop(a: Airdrop, removeInteractable: (id: string) => void): void {
     a.opened = true;
-    a.pod.visible = false;
-    (a.beacon.material as THREE.Material).dispose();
+    a.pod.visible = false; // shared materials: never disposed, just hidden
     removeInteractable(`airdrop-${a.pos.x.toFixed(1)}-${a.pos.z.toFixed(1)}`);
   }
 

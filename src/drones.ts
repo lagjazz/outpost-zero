@@ -41,15 +41,35 @@ export interface DroneCallbacks {
 const armor = (c: number) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.5, metalness: 0.65 });
 const hitMat = new THREE.MeshBasicMaterial({ visible: false });
 
+// Memoized geometry factories: every drone of a kind reuses the same buffer
+// geometry (materials stay per-drone so hit-flash/shield state is independent).
+// Warm-hostiles builds one of each kind at boot, which uploads these buffers
+// once; later spawns allocate no GPU data at all.
+const geoCache = new Map<string, THREE.BufferGeometry>();
+function geo(key: string, make: () => THREE.BufferGeometry): THREE.BufferGeometry {
+  let g = geoCache.get(key);
+  if (!g) {
+    g = make();
+    geoCache.set(key, g);
+  }
+  return g;
+}
+const gBox = (w: number, h: number, d: number): THREE.BufferGeometry => geo(`box:${w},${h},${d}`, () => new THREE.BoxGeometry(w, h, d));
+const gCyl = (rt: number, rb: number, h: number, s: number): THREE.BufferGeometry => geo(`cyl:${rt},${rb},${h},${s}`, () => new THREE.CylinderGeometry(rt, rb, h, s));
+const gSph = (r: number, ws: number, hs: number): THREE.BufferGeometry => geo(`sph:${r},${ws},${hs}`, () => new THREE.SphereGeometry(r, ws, hs));
+const gSphArc = (r: number, ws: number, hs: number, ps: number, pl: number): THREE.BufferGeometry => geo(`sphA:${r},${ws},${hs},${ps},${pl}`, () => new THREE.SphereGeometry(r, ws, hs, 0, Math.PI * 2, ps, pl));
+const gTorus = (r: number, t: number, rs: number, ts: number): THREE.BufferGeometry => geo(`tor:${r},${t},${rs},${ts}`, () => new THREE.TorusGeometry(r, t, rs, ts));
+const gCap = (r: number, l: number, cs: number, rs: number): THREE.BufferGeometry => geo(`cap:${r},${l},${cs},${rs}`, () => new THREE.CapsuleGeometry(r, l, cs, rs));
+
 function rotor(parent: THREE.Group, x: number, y: number, z: number, r: number, blades: THREE.Material): THREE.Object3D {
   const arm = new THREE.Group();
   arm.position.set(x, y, z);
-  const duct = new THREE.Mesh(new THREE.TorusGeometry(r, 0.045, 6, 14), armor(0x2c3340));
+  const duct = new THREE.Mesh(gTorus(r, 0.045, 6, 14), armor(0x2c3340));
   duct.rotation.x = Math.PI / 2;
   arm.add(duct);
   const bladesG = new THREE.Group();
   for (let i = 0; i < 2; i++) {
-    const b = new THREE.Mesh(new THREE.BoxGeometry(r * 1.9, 0.015, 0.08), blades);
+    const b = new THREE.Mesh(gBox(r * 1.9, 0.015, 0.08), blades);
     b.rotation.y = (i * Math.PI) / 2;
     bladesG.add(b);
   }
@@ -63,18 +83,18 @@ function rotor(parent: THREE.Group, x: number, y: number, z: number, r: number, 
 function buildScout(): THREE.Group {
   const g = new THREE.Group();
   const bodyMat = armor(0x465064);
-  const hull = new THREE.Mesh(new THREE.CapsuleGeometry(0.24, 0.42, 4, 10), bodyMat);
+  const hull = new THREE.Mesh(gCap(0.24, 0.42, 4, 10), bodyMat);
   hull.rotation.x = Math.PI / 2;
   g.add(hull);
   const eyeMat = new THREE.MeshStandardMaterial({ color: 0x331100, emissive: new THREE.Color('#ff5a1f'), emissiveIntensity: 2.4 });
-  const eye = new THREE.Mesh(new THREE.SphereGeometry(0.09, 10, 10), eyeMat);
+  const eye = new THREE.Mesh(gSph(0.09, 10, 10), eyeMat);
   eye.position.set(0, 0, -0.42);
   g.add(eye);
   for (let i = 0; i < 3; i++) {
     const a = (i / 3) * Math.PI * 2 + 0.5;
     const ax = Math.cos(a) * 0.42;
     const az = Math.sin(a) * 0.42;
-    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.04, 0.06), bodyMat);
+    const arm = new THREE.Mesh(gBox(0.35, 0.04, 0.06), bodyMat);
     arm.position.set(ax * 0.6, 0.12, az * 0.6);
     arm.lookAt(0, 0.12, 0);
     g.add(arm);
@@ -86,21 +106,21 @@ function buildScout(): THREE.Group {
 
 function buildHeavy(): THREE.Group {
   const g = new THREE.Group();
-  const hull = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.75, 1.0), armor(0x3a4454));
+  const hull = new THREE.Mesh(gBox(1.3, 0.75, 1.0), armor(0x3a4454));
   hull.castShadow = true;
   g.add(hull);
-  const shoulder = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.22, 0.5), armor(0x2e3746));
+  const shoulder = new THREE.Mesh(gBox(1.7, 0.22, 0.5), armor(0x2e3746));
   shoulder.position.set(0, 0.42, 0);
   g.add(shoulder);
   rotor(g, -0.75, 0.55, 0, 0.42, armor(0x59647a));
   rotor(g, 0.75, 0.55, 0, 0.42, armor(0x59647a));
   const coreMat = new THREE.MeshStandardMaterial({ color: 0x032a33, emissive: new THREE.Color('#22d3ee'), emissiveIntensity: 2 });
-  const core = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.3, 10), coreMat);
+  const core = new THREE.Mesh(gCyl(0.18, 0.18, 0.3, 10), coreMat);
   core.position.set(0, 0, 0.55);
   g.add(core);
   const eyeMat = new THREE.MeshStandardMaterial({ color: 0x330d0d, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 2.2 });
   for (const sx of [-0.3, 0.3]) {
-    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.07, 8, 8), eyeMat);
+    const eye = new THREE.Mesh(gSph(0.07, 8, 8), eyeMat);
     eye.position.set(sx, 0.05, -0.52);
     g.add(eye);
   }
@@ -112,7 +132,7 @@ function buildHeavy(): THREE.Group {
     depthWrite: false,
     side: THREE.DoubleSide,
   });
-  const shield = new THREE.Mesh(new THREE.SphereGeometry(1.25, 16, 12, Math.PI * 0.7, Math.PI * 1.6), shieldMat);
+  const shield = new THREE.Mesh(gSphArc(1.25, 16, 12, Math.PI * 0.7, Math.PI * 1.6), shieldMat);
   shield.rotation.y = Math.PI / 2;
   g.add(shield);
   g.userData.shieldMesh = shield;
@@ -122,20 +142,20 @@ function buildHeavy(): THREE.Group {
 function buildKamikaze(): THREE.Group {
   const g = new THREE.Group();
   const coreMat = new THREE.MeshStandardMaterial({ color: 0x3a0d0d, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 2.4 });
-  const core = new THREE.Mesh(new THREE.SphereGeometry(0.34, 12, 12), coreMat);
+  const core = new THREE.Mesh(gSph(0.34, 12, 12), coreMat);
   g.add(core);
-  const frame = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.08, 1.0), armor(0x4a4034));
+  const frame = new THREE.Mesh(gBox(1.0, 0.08, 1.0), armor(0x4a4034));
   frame.rotation.y = Math.PI / 4;
   frame.position.y = 0.18;
   g.add(frame);
   for (const [ax, az] of [[0.42, 0.42], [-0.42, 0.42], [0.42, -0.42], [-0.42, -0.42]] as const) {
     rotor(g, ax, 0.26, az, 0.22, armor(0x6b7686));
   }
-  const fin = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.3, 0.2), armor(0x333c49));
+  const fin = new THREE.Mesh(gBox(0.05, 0.3, 0.2), armor(0x333c49));
   fin.position.set(0, 0.35, 0.3);
   g.add(fin);
   const eyeMat = new THREE.MeshStandardMaterial({ color: 0x330d0d, emissive: new THREE.Color('#ff7847'), emissiveIntensity: 2.6 });
-  const eye = new THREE.Mesh(new THREE.SphereGeometry(0.08, 8, 8), eyeMat);
+  const eye = new THREE.Mesh(gSph(0.08, 8, 8), eyeMat);
   eye.position.set(0, -0.2, -0.3);
   g.add(eye);
   g.userData.blades = g.userData.blades as THREE.Object3D[];
@@ -144,26 +164,26 @@ function buildKamikaze(): THREE.Group {
 
 function buildWarden(): THREE.Group {
   const g = new THREE.Group();
-  const hull = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.42, 0.95, 6), armor(0x4e473a));
+  const hull = new THREE.Mesh(gCyl(0.3, 0.42, 0.95, 6), armor(0x4e473a));
   hull.castShadow = true;
   g.add(hull);
-  const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.46, 0.46, 0.12, 6), armor(0x33302a));
+  const collar = new THREE.Mesh(gCyl(0.46, 0.46, 0.12, 6), armor(0x33302a));
   collar.position.y = 0.4;
   g.add(collar);
   rotor(g, -0.62, 0.62, 0, 0.3, armor(0x77705f));
   rotor(g, 0.62, 0.62, 0, 0.3, armor(0x77705f));
-  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.06, 0.95, 6), armor(0x2a2d35));
+  const barrel = new THREE.Mesh(gCyl(0.05, 0.06, 0.95, 6), armor(0x2a2d35));
   barrel.rotation.x = Math.PI / 2;
   barrel.position.set(0, -0.05, -0.72);
   g.add(barrel);
   const eyeMat = new THREE.MeshStandardMaterial({ color: 0x332200, emissive: new THREE.Color('#ffb020'), emissiveIntensity: 2.6 });
-  const eye = new THREE.Mesh(new THREE.SphereGeometry(0.1, 10, 10), eyeMat);
+  const eye = new THREE.Mesh(gSph(0.1, 10, 10), eyeMat);
   eye.position.set(0, 0.05, -0.4);
   g.add(eye);
-  const scope = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.1, 0.24), armor(0x1f2430));
+  const scope = new THREE.Mesh(gBox(0.16, 0.1, 0.24), armor(0x1f2430));
   scope.position.set(0, 0.28, -0.3);
   g.add(scope);
-  const fin = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.34, 0.26), armor(0x333c49));
+  const fin = new THREE.Mesh(gBox(0.05, 0.34, 0.26), armor(0x333c49));
   fin.position.set(0, 0.28, 0.36);
   g.add(fin);
   g.userData.blades = g.userData.blades as THREE.Object3D[];
@@ -172,10 +192,10 @@ function buildWarden(): THREE.Group {
 
 function buildBomber(): THREE.Group {
   const g = new THREE.Group();
-  const hull = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.42, 1.15), armor(0x504636));
+  const hull = new THREE.Mesh(gBox(1.15, 0.42, 1.15), armor(0x504636));
   hull.castShadow = true;
   g.add(hull);
-  const deck = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.12, 1.5), armor(0x38322a));
+  const deck = new THREE.Mesh(gBox(1.5, 0.12, 1.5), armor(0x38322a));
   deck.position.y = 0.26;
   g.add(deck);
   for (let i = 0; i < 6; i++) {
@@ -183,16 +203,16 @@ function buildBomber(): THREE.Group {
     rotor(g, Math.cos(a) * 0.88, 0.36, Math.sin(a) * 0.88, 0.26, armor(0x6f6858));
   }
   const podMat = new THREE.MeshStandardMaterial({ color: 0x241f1a, roughness: 0.6, metalness: 0.4, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 1.1 });
-  const pod = new THREE.Mesh(new THREE.SphereGeometry(0.3, 12, 10), podMat);
+  const pod = new THREE.Mesh(gSph(0.3, 12, 10), podMat);
   pod.position.y = -0.42;
   g.add(pod);
   const stripMat = new THREE.MeshStandardMaterial({ color: 0x111, emissive: new THREE.Color('#f59e0b'), emissiveIntensity: 1.6 });
-  const strip = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.06, 0.06), stripMat);
+  const strip = new THREE.Mesh(gBox(1.2, 0.06, 0.06), stripMat);
   strip.position.set(0, 0.34, 0.62);
   g.add(strip);
   const eyeMat = new THREE.MeshStandardMaterial({ color: 0x330d0d, emissive: new THREE.Color('#ff7847'), emissiveIntensity: 2.2 });
   for (const sx of [-0.4, 0.4]) {
-    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.06, 8, 8), eyeMat);
+    const eye = new THREE.Mesh(gSph(0.06, 8, 8), eyeMat);
     eye.position.set(sx, 0.1, -0.6);
     g.add(eye);
   }
@@ -204,23 +224,23 @@ function buildCrawler(): THREE.Group {
   // Six-legged ground sweeper: low armored chassis, forward sensor mast,
   // rear pusher duct. Legs are animated via userData.legs.
   const g = new THREE.Group();
-  const hull = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.36, 1.1, 6), armor(0x4a4436));
+  const hull = new THREE.Mesh(gCyl(0.5, 0.36, 1.1, 6), armor(0x4a4436));
   hull.rotation.x = Math.PI / 2;
   hull.position.y = 0.62;
   hull.castShadow = true;
   g.add(hull);
-  const plate = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.14, 0.7), armor(0x35302a));
+  const plate = new THREE.Mesh(gBox(0.9, 0.14, 0.7), armor(0x35302a));
   plate.position.y = 1.0;
   g.add(plate);
   const eyeMat = new THREE.MeshStandardMaterial({ color: 0x330d0d, emissive: new THREE.Color('#ff5a1f'), emissiveIntensity: 2.4 });
-  const eye = new THREE.Mesh(new THREE.SphereGeometry(0.09, 8, 8), eyeMat);
+  const eye = new THREE.Mesh(gSph(0.09, 8, 8), eyeMat);
   eye.position.set(0, 0.75, -0.58);
   g.add(eye);
   const jawMat = new THREE.MeshStandardMaterial({ color: 0x1c1a16, roughness: 0.6, metalness: 0.5, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 0.8 });
-  const jaw = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.2, 0.3), jawMat);
+  const jaw = new THREE.Mesh(gBox(0.34, 0.2, 0.3), jawMat);
   jaw.position.set(0, 0.45, -0.68);
   g.add(jaw);
-  const legGeo = new THREE.BoxGeometry(0.09, 0.62, 0.09);
+  const legGeo = gBox(0.09, 0.62, 0.09);
   const legMat = armor(0x2c3038);
   const legs: THREE.Object3D[] = [];
   for (const [side, phase] of [[-1, 0], [1, Math.PI]] as const) {
@@ -244,30 +264,30 @@ function buildCrawler(): THREE.Group {
 function buildColossus(): THREE.Group {
   // Armored flying fortress: slab hull, four big rotors, front shield dome, gun pod.
   const g = new THREE.Group();
-  const hull = new THREE.Mesh(new THREE.BoxGeometry(2.5, 1.3, 1.9), armor(0x39414f));
+  const hull = new THREE.Mesh(gBox(2.5, 1.3, 1.9), armor(0x39414f));
   hull.castShadow = true;
   g.add(hull);
-  const bridge = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.5, 1.2), armor(0x2b3340));
+  const bridge = new THREE.Mesh(gBox(1.5, 0.5, 1.2), armor(0x2b3340));
   bridge.position.y = 0.85;
   g.add(bridge);
   for (const [sx, sz] of [[-1.35, -0.9], [1.35, -0.9], [-1.35, 0.9], [1.35, 0.9]] as const) {
     rotor(g, sx, 1.15, sz, 0.68, armor(0x57627a));
   }
   const coreMat = new THREE.MeshStandardMaterial({ color: 0x032a33, emissive: new THREE.Color('#22d3ee'), emissiveIntensity: 1.8 });
-  const core = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.5, 12), coreMat);
+  const core = new THREE.Mesh(gCyl(0.3, 0.3, 0.5, 12), coreMat);
   core.position.set(0, 0, 0.98);
   g.add(core);
   const eyeMat = new THREE.MeshStandardMaterial({ color: 0x330d0d, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 2.2 });
   for (const sx of [-0.55, 0, 0.55]) {
-    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.09, 8, 8), eyeMat);
+    const eye = new THREE.Mesh(gSph(0.09, 8, 8), eyeMat);
     eye.position.set(sx, 0.15, -0.98);
     g.add(eye);
   }
-  const pod = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.4, 1.2), armor(0x232a35));
+  const pod = new THREE.Mesh(gBox(0.8, 0.4, 1.2), armor(0x232a35));
   pod.position.set(0, -0.8, -0.5);
   g.add(pod);
   for (const sx of [-0.25, 0.25]) {
-    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.07, 0.9, 6), armor(0x1a1f28));
+    const barrel = new THREE.Mesh(gCyl(0.06, 0.07, 0.9, 6), armor(0x1a1f28));
     barrel.rotation.x = Math.PI / 2;
     barrel.position.set(sx, -0.85, -1.2);
     g.add(barrel);
@@ -280,7 +300,7 @@ function buildColossus(): THREE.Group {
     depthWrite: false,
     side: THREE.DoubleSide,
   });
-  const shield = new THREE.Mesh(new THREE.SphereGeometry(2.05, 18, 12, Math.PI * 0.7, Math.PI * 1.6), shieldMat);
+  const shield = new THREE.Mesh(gSphArc(2.05, 18, 12, Math.PI * 0.7, Math.PI * 1.6), shieldMat);
   shield.rotation.y = Math.PI / 2;
   g.add(shield);
   g.userData.shieldMesh = shield;
@@ -334,14 +354,29 @@ const BUILDERS: Record<DroneKind, () => THREE.Group> = {
   colossus: buildColossus,
 };
 
+interface BoltSlot {
+  mesh: THREE.Mesh;
+  vel: THREE.Vector3;
+  life: number;
+  dmg: number;
+}
+
+const PROJ_POOL = 96;
+const BOMB_POOL = 24;
+
 export class DroneManager {
   drones: Drone[] = [];
   private scene: THREE.Scene;
-  private projectiles: { mesh: THREE.Mesh; vel: THREE.Vector3; life: number; dmg: number }[] = [];
-  private bombs: { mesh: THREE.Mesh; vel: THREE.Vector3; life: number }[] = [];
-  private projGeo = new THREE.SphereGeometry(0.09, 6, 6);
+  // Projectile/bomb pools: pre-built hidden meshes (shared geo+material) so the
+  // first shot of a fight compiles nothing and uploads nothing — the boot
+  // warm-up already painted these. Only visibility/position change at runtime.
+  private projectiles: BoltSlot[] = [];
+  private projFree: number[] = [];
+  private bombs: BoltSlot[] = [];
+  private bombFree: number[] = [];
+  private projGeo = gSph(0.09, 6, 6);
   private projMat = new THREE.MeshBasicMaterial({ color: new THREE.Color('#ff6b4a'), blending: THREE.AdditiveBlending, transparent: true, fog: false });
-  private bombGeo = new THREE.SphereGeometry(0.16, 8, 8);
+  private bombGeo = gSph(0.16, 8, 8);
   private bombMat = new THREE.MeshStandardMaterial({ color: 0x14100c, roughness: 0.7, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 1.2 });
   private colliders: Collider[] = [];
   private hpMul = 1;
@@ -349,6 +384,47 @@ export class DroneManager {
 
   constructor(scene: THREE.Scene, private cb: DroneCallbacks) {
     this.scene = scene;
+    for (let i = 0; i < PROJ_POOL; i++) {
+      const mesh = new THREE.Mesh(this.projGeo, this.projMat);
+      mesh.visible = false;
+      scene.add(mesh);
+      this.projectiles.push({ mesh, vel: new THREE.Vector3(), life: 0, dmg: 0 });
+      this.projFree.push(i);
+    }
+    for (let i = 0; i < BOMB_POOL; i++) {
+      const mesh = new THREE.Mesh(this.bombGeo, this.bombMat);
+      mesh.visible = false;
+      scene.add(mesh);
+      this.bombs.push({ mesh, vel: new THREE.Vector3(), life: 0, dmg: 0 });
+      this.bombFree.push(i);
+    }
+  }
+
+  /** Grab a bolt slot (steal the oldest when saturated) and arm it. */
+  private fireBolt(pool: BoltSlot[], free: number[], from: THREE.Vector3, vel: THREE.Vector3, life: number, dmg: number, scale = 1): void {
+    let i = free.pop();
+    if (i === undefined) {
+      // oldest active bolt: hide it and reuse its slot
+      const old = pool.find((p) => p.life > 0);
+      if (old) {
+        old.mesh.visible = false;
+        i = pool.indexOf(old);
+      }
+    }
+    if (i === undefined) return;
+    const b = pool[i];
+    b.mesh.scale.setScalar(scale);
+    b.mesh.position.copy(from);
+    b.mesh.visible = true;
+    b.vel.copy(vel);
+    b.life = life;
+    b.dmg = dmg;
+  }
+
+  private static release(pool: BoltSlot[], free: number[], i: number): void {
+    pool[i].mesh.visible = false;
+    pool[i].life = 0;
+    free.push(i);
   }
 
   /** Buildings/terrain the drones must fly around (same set the player collides with). */
@@ -367,16 +443,16 @@ export class DroneManager {
     const group = BUILDERS[kind]();
     group.position.copy(pos);
 
-    const bodyHit = new THREE.Mesh(new THREE.SphereGeometry(base.radius + 0.12, 8, 8), hitMat);
+    const bodyHit = new THREE.Mesh(gSph(base.radius + 0.12, 8, 8), hitMat);
     group.add(bodyHit);
     let shieldHit: THREE.Mesh | null = null;
     let weakHit: THREE.Mesh | null = null;
     if (kind === 'heavy' || kind === 'colossus') {
       const big = kind === 'colossus';
-      shieldHit = new THREE.Mesh(new THREE.SphereGeometry(big ? 2.15 : 1.3, 10, 8), hitMat);
+      shieldHit = new THREE.Mesh(gSph(big ? 2.15 : 1.3, 10, 8), hitMat);
       shieldHit.position.set(0, 0, big ? -0.9 : -0.45);
       group.add(shieldHit);
-      weakHit = new THREE.Mesh(new THREE.SphereGeometry(big ? 0.75 : 0.5, 6, 6), hitMat);
+      weakHit = new THREE.Mesh(gSph(big ? 0.75 : 0.5, 6, 6), hitMat);
       weakHit.position.set(0, big ? 1.05 : 0.62, 0);
       group.add(weakHit);
     }
@@ -488,10 +564,12 @@ export class DroneManager {
   clearHostiles(): void {
     for (const d of this.drones) this.scene.remove(d.group);
     this.drones.length = 0;
-    for (const p of this.projectiles) this.scene.remove(p.mesh);
-    this.projectiles.length = 0;
-    for (const b of this.bombs) this.scene.remove(b.mesh);
-    this.bombs.length = 0;
+    this.projectiles.forEach((p, i) => {
+      if (p.life > 0) DroneManager.release(this.projectiles, this.projFree, i);
+    });
+    this.bombs.forEach((b, i) => {
+      if (b.life > 0) DroneManager.release(this.bombs, this.bombFree, i);
+    });
   }
 
   update(
@@ -613,11 +691,9 @@ export class DroneManager {
         d.fireTimer -= dt;
         if (d.fireTimer <= 0) {
           d.fireTimer = base.fireInterval * (0.8 + Math.random() * 0.5);
-          const mesh = new THREE.Mesh(this.bombGeo, this.bombMat);
-          mesh.position.copy(d.group.position).add(new THREE.Vector3(0, -0.6, 0));
+          const from = d.group.position.clone().add(new THREE.Vector3(0, -0.6, 0));
           const lead = new THREE.Vector3(playerPos.x - d.group.position.x, 0, playerPos.z - d.group.position.z).clampLength(0, 3);
-          this.scene.add(mesh);
-          this.bombs.push({ mesh, vel: new THREE.Vector3(lead.x, -1, lead.z), life: 8 });
+          this.fireBolt(this.bombs, this.bombFree, from, new THREE.Vector3(lead.x, -1, lead.z), 8, 0);
           this.cb.onBeep(320);
         }
       } else {
@@ -659,11 +735,7 @@ export class DroneManager {
             const jitter = new THREE.Vector3((Math.random() - 0.5) * 0.5, (Math.random() - 0.5) * 0.3, (Math.random() - 0.5) * 0.5).multiplyScalar(d.spotted ? 0.3 : 1);
             to.add(jitter);
             this.cb.onLaser(from, to);
-            const mesh = new THREE.Mesh(this.projGeo, this.projMat);
-            mesh.scale.setScalar(1.4);
-            mesh.position.copy(from);
-            this.scene.add(mesh);
-            this.projectiles.push({ mesh, vel: to.sub(from).normalize().multiplyScalar(34), life: 4, dmg: Math.round(base.fireDamage * this.dmgMul) });
+            this.fireBolt(this.projectiles, this.projFree, from, to.sub(from).normalize().multiplyScalar(34), 4, Math.round(base.fireDamage * this.dmgMul), 1.4);
           }
         } else {
           d.fireTimer -= dt;
@@ -687,12 +759,8 @@ export class DroneManager {
             const jitter = new THREE.Vector3((Math.random() - 0.5) * 1.4, (Math.random() - 0.5) * 1.0, (Math.random() - 0.5) * 1.4).multiplyScalar(d.spotted ? 0.4 : 1);
             const to = playerPos.clone().add(new THREE.Vector3(0, 1.1, 0)).add(jitter);
             this.cb.onLaser(from, to);
-            const projPos = from.clone();
             const dir = to.sub(from).normalize().multiplyScalar(19);
-            const mesh = new THREE.Mesh(this.projGeo, this.projMat);
-            mesh.position.copy(projPos);
-            this.scene.add(mesh);
-            this.projectiles.push({ mesh, vel: dir, life: 3, dmg: Math.round(base.fireDamage * this.dmgMul) });
+            this.fireBolt(this.projectiles, this.projFree, from, dir, 3, Math.round(base.fireDamage * this.dmgMul));
           }
         } else if (d.fireTimer <= 0 && dist < base.attackRange) {
           d.burstLeft = base.burst;
@@ -708,8 +776,9 @@ export class DroneManager {
     }
 
     // projectiles (laser bolts are blocked by buildings; fast bolts sweep-tested)
-    for (let i = this.projectiles.length - 1; i >= 0; i--) {
+    for (let i = 0; i < this.projectiles.length; i++) {
       const p = this.projectiles[i];
+      if (p.life <= 0) continue;
       const prev = p.mesh.position.clone();
       p.mesh.position.addScaledVector(p.vel, dt);
       p.life -= dt;
@@ -722,15 +791,13 @@ export class DroneManager {
       }
       if (this.solidAt(pp)) hit = true;
       if (p.life <= 0 || pp.y < 0.1) hit = true;
-      if (hit) {
-        this.scene.remove(p.mesh);
-        this.projectiles.splice(i, 1);
-      }
+      if (hit) DroneManager.release(this.projectiles, this.projFree, i);
     }
 
     // bomber drop-shots: gravity fall, detonate on ground or building
-    for (let i = this.bombs.length - 1; i >= 0; i--) {
+    for (let i = 0; i < this.bombs.length; i++) {
       const b = this.bombs[i];
+      if (b.life <= 0) continue;
       b.vel.y -= 15 * dt;
       b.mesh.position.addScaledVector(b.vel, dt);
       b.mesh.rotation.x += dt * 6;
@@ -738,8 +805,7 @@ export class DroneManager {
       const bp = b.mesh.position;
       if (bp.y <= 0.3 || this.solidAt(bp) || b.life <= 0) {
         this.cb.onExplosion(bp.clone(), 'bomber', false);
-        this.scene.remove(b.mesh);
-        this.bombs.splice(i, 1);
+        DroneManager.release(this.bombs, this.bombFree, i);
       }
     }
   }

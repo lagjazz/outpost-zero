@@ -42,11 +42,14 @@ interface MapRuntime {
 }
 
 interface Rocket {
+  slot: number;
   mesh: THREE.Mesh;
   vel: THREE.Vector3;
   life: number;
   direct: number;
 }
+
+const ROCKET_POOL = 12;
 
 class Game {
   private engine: Engine;
@@ -74,6 +77,10 @@ class Game {
   private rockets: Rocket[] = [];
   private rocketGeo = new THREE.ConeGeometry(0.09, 0.5, 6);
   private rocketMat = new THREE.MeshBasicMaterial({ color: new THREE.Color('#ffd9a0'), blending: THREE.AdditiveBlending, transparent: true, fog: false });
+  // pre-built hidden rocket meshes: their program/geometry warm up at boot, and
+  // firing only re-arms a slot (no allocation, no first-use compile).
+  private rocketPool: THREE.Mesh[] = [];
+  private rocketFree: number[] = [];
 
   private firingHeld = false;
   private firePressedEdge = false;
@@ -124,6 +131,13 @@ class Game {
     // every shader program, which is the freeze people feel in the first minutes.
     this.lightRig = new LightRig(scene, LIGHT_BUDGET);
     console.log(`[lights] ${this.lightRig.collect()} fixtures -> pool of ${this.lightRig.budget}`);
+    for (let i = 0; i < ROCKET_POOL; i++) {
+      const mesh = new THREE.Mesh(this.rocketGeo, this.rocketMat);
+      mesh.visible = false;
+      scene.add(mesh);
+      this.rocketPool.push(mesh);
+      this.rocketFree.push(i);
+    }
     const tWarm = performance.now();
     this.warmHostiles();
     this.prewarmMaterials();
@@ -461,11 +475,12 @@ class Game {
 
     if (this.weapons.current === 'launcher') {
       const dir = shot.dirs[0];
-      const mesh = new THREE.Mesh(this.rocketGeo, this.rocketMat);
+      const slot = this.takeRocketSlot();
+      const mesh = this.rocketPool[slot];
       mesh.position.copy(shot.muzzleWorld);
       mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
-      this.engine.scene.add(mesh);
-      this.rockets.push({ mesh, vel: dir.clone().multiplyScalar(ROCKET.speed), life: 8, direct: shot.damage });
+      mesh.visible = true;
+      this.rockets.push({ slot, mesh, vel: dir.clone().multiplyScalar(ROCKET.speed), life: 8, direct: shot.damage });
       this.effects.flash(shot.muzzleWorld, '#ffb27f', 26, 6, 0.12);
     } else {
       const from = this.engine.camera.position;
@@ -511,8 +526,21 @@ class Game {
   // ---------- Vulcan SAM rockets ----------
 
   private clearRockets(): void {
-    for (const r of this.rockets) this.engine.scene.remove(r.mesh);
+    for (const r of this.rockets) {
+      r.mesh.visible = false;
+      this.rocketFree.push(r.slot);
+    }
     this.rockets.length = 0;
+  }
+
+  /** Free rocket slot, stealing the oldest in-flight rocket when saturated. */
+  private takeRocketSlot(): number {
+    const i = this.rocketFree.pop();
+    if (i !== undefined) return i;
+    const old = this.rockets.shift()!;
+    old.mesh.visible = false;
+    this.rocketFree.push(old.slot);
+    return this.rocketFree.pop()!;
   }
 
   /** Closest distance from point p to segment a→b. */
@@ -588,7 +616,8 @@ class Game {
       if (p.y < 0.15 || this.solidWorldPoint(p) || r.life <= 0) detonate = true;
       if (detonate) {
         this.detonateRocket(p.clone(), r.direct);
-        this.engine.scene.remove(r.mesh);
+        r.mesh.visible = false;
+        this.rocketFree.push(r.slot);
         this.rockets.splice(i, 1);
       }
     }
