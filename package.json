@@ -1,0 +1,20 @@
+{
+  "name": "outpost-zero",
+  "version": "1.0.0",
+  "description": "Outpost Zero: Signal Hold — alpine night radio-outpost defense FPS in the browser",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite --port 4173",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --port 4173"
+  },
+  "dependencies": {
+    "three": "^0.160.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.160.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
