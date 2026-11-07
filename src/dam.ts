@@ -101,6 +101,42 @@ export function buildDam(scene: THREE.Scene): WorldBundle {
     group.add(lamp);
   }
 
+  // Massive steel penstock turbine pipes descending the dam face
+  const pipeMat = new THREE.MeshStandardMaterial({ color: 0x2c3a4a, roughness: 0.4, metalness: 0.8 });
+  for (const px of [-9, 0, 9]) {
+    const pipe = new THREE.Mesh(new THREE.CylinderGeometry(1.15, 1.15, 24, 12), pipeMat);
+    pipe.position.set(px, 11.5, -27.2);
+    pipe.rotation.x = 0.14;
+    pipe.castShadow = true;
+    group.add(pipe);
+    const ring = new THREE.Mesh(
+      new THREE.TorusGeometry(1.22, 0.12, 8, 16),
+      new THREE.MeshStandardMaterial({ color: 0x0b131e, emissive: new THREE.Color('#38bdf8'), emissiveIntensity: 1.5 }),
+    );
+    ring.position.set(px, 6.0, -26.4);
+    group.add(ring);
+  }
+
+  // High-voltage transmission tower in the SW transformer yard
+  const pylonMat = new THREE.MeshStandardMaterial({ color: 0x3b4758, roughness: 0.5, metalness: 0.7 });
+  const pylon = new THREE.Mesh(new THREE.ConeGeometry(2.2, 15, 4), pylonMat);
+  pylon.position.set(-28, 7.5, 20);
+  pylon.rotation.y = Math.PI / 4;
+  group.add(pylon);
+  for (const ay of [10, 13.5]) {
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(6.8, 0.25, 0.25), pylonMat);
+    arm.position.set(-28, ay, 20);
+    group.add(arm);
+    for (const side of [-3.2, 3.2]) {
+      const ins = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.14, 0.14, 0.8, 8),
+        new THREE.MeshStandardMaterial({ color: 0x0ea5e9, emissive: new THREE.Color('#38bdf8'), emissiveIntensity: 1.6 }),
+      );
+      ins.position.set(-28 + side, ay - 0.5, 20);
+      group.add(ins);
+    }
+  }
+
   // distant peaks behind the dam
   const peakMat = new THREE.MeshStandardMaterial({ color: 0x0d1420, roughness: 1, fog: true });
   for (let i = 0; i < 9; i++) {

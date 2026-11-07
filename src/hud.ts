@@ -1,7 +1,7 @@
-// Semantic DOM HUD: top telemetry bar, crosshair, hit direction arcs, bottom dock,
-// interaction prompts, upgrade terminal, brief & result screens.
+// Semantic DOM HUD: top telemetry bar, tactical sub-objective card, active buffs strip,
+// crosshair, hit direction arcs, 6-weapon bottom dock, upgrade workbench, 8-level briefing & result screens.
 import { LEVELS, UPGRADE, WEAPONS, weaponTier } from './config';
-import type { MissionState, UpgradeLevels, WeaponId, WeaponRuntime } from './state';
+import type { ActiveSubObjective, MissionState, PlayerState, UpgradeLevels, WeaponId, WeaponRuntime } from './state';
 
 const TRACKS: { key: keyof UpgradeLevels; label: string }[] = [
   { key: 'damage', label: 'Damage' },
@@ -10,11 +10,24 @@ const TRACKS: { key: keyof UpgradeLevels; label: string }[] = [
   { key: 'reload', label: 'Reload' },
 ];
 
+const WEAPON_ORDER: WeaponId[] = ['pistol', 'rifle', 'shotgun', 'plasma', 'launcher', 'railgun'];
+
 const WEAPON_LABELS: Record<WeaponId, string> = {
   pistol: 'M9 Pistol',
   rifle: 'K2 Rifle',
   shotgun: 'M870 Shotgun',
+  plasma: 'Helios Arc',
   launcher: 'Vulcan SAM',
+  railgun: 'Aegis Railgun',
+};
+
+const WEAPON_SHORT: Record<WeaponId, string> = {
+  pistol: '1·M9',
+  rifle: '2·K2',
+  shotgun: '3·SG',
+  plasma: '4·ARC',
+  launcher: '5·SAM',
+  railgun: '6·RAIL',
 };
 
 function el(cls: string, parent: HTMLElement, text?: string): HTMLElement {
@@ -26,11 +39,14 @@ function el(cls: string, parent: HTMLElement, text?: string): HTMLElement {
 }
 
 export interface HudCallbacks {
-  onStart(): void;
+  onStart(levelIdx?: number): void;
+  onSelectPreviewLevel?(levelIdx: number): void;
   onBuy(weapon: WeaponId, track: keyof UpgradeLevels): void;
+  onUnlockWeapon?(weapon: WeaponId): void;
   onCloseUpgrade(): void;
   onRestart(): void;
   onResume(): void;
+  onToggleMusic?(): boolean;
 }
 
 export class Hud {
@@ -44,6 +60,16 @@ export class Hud {
   private lightChip: HTMLElement;
   private rankChip: HTMLElement;
   private mapChip: HTMLElement;
+  private musicChip: HTMLElement;
+  // tactical sub-objective panel
+  private objPanel: HTMLElement;
+  private objKicker: HTMLElement;
+  private objTimer: HTMLElement;
+  private objTitle: HTMLElement;
+  private objDesc: HTMLElement;
+  private objFill: HTMLElement;
+  // active buffs strip
+  private buffStrip: HTMLElement;
   // crosshair
   private cross: HTMLElement;
   private crossTicks: HTMLElement[] = [];
@@ -64,6 +90,7 @@ export class Hud {
   private weaponName: HTMLElement;
   private ammoMag: HTMLElement;
   private ammoReserve: HTMLElement;
+  private weaponSlotEls: Record<WeaponId, HTMLElement>;
   private creditsText: HTMLElement;
   private reloadHint: HTMLElement;
   // banner
@@ -77,6 +104,9 @@ export class Hud {
   private pause: HTMLElement;
   private upgradeBody: HTMLElement;
   private endBody: HTMLElement;
+  private selectedBriefLevel = 0;
+  private deployBtn!: HTMLElement;
+  private levelRows: HTMLElement[] = [];
   private lastValues = new Map<string, string>();
 
   constructor(cb: HudCallbacks) {
@@ -98,6 +128,27 @@ export class Hud {
     this.lightChip = el('chip', top, 'Searchlight ○');
     this.rankChip = el('chip', top, 'RANK 1');
     this.mapChip = el('chip', top, 'ALPINE PASS');
+    this.musicChip = el('chip interactive', top, 'SYNTH ○ (M)');
+    this.musicChip.addEventListener('click', () => {
+      if (cb.onToggleMusic) {
+        const on = cb.onToggleMusic();
+        this.setMusicState(on);
+      }
+    });
+
+    // ---- tactical sub-objective panel ----
+    this.objPanel = el('objective-panel', this.root);
+    this.objPanel.style.display = 'none';
+    const objHead = el('obj-header', this.objPanel);
+    this.objKicker = el('obj-kicker', objHead, 'TACTICAL DIRECTIVE');
+    this.objTimer = el('obj-timer mono', objHead, '40s');
+    this.objTitle = el('obj-title', this.objPanel, '');
+    this.objDesc = el('obj-desc', this.objPanel, '');
+    const objBar = el('obj-bar', this.objPanel);
+    this.objFill = el('fill cyan', objBar);
+
+    // ---- active buffs strip ----
+    this.buffStrip = el('buff-strip', this.root);
 
     // ---- crosshair ----
     const crossWrap = el('crosshair', this.root);
@@ -137,10 +188,17 @@ export class Hud {
     this.ammoReserve = el('ammo-reserve mono', ammo, '96');
     this.reloadHint = el('reload-hint', mid, 'Reloading…');
     this.reloadHint.style.display = 'none';
+
+    const slotsWrap = el('weapon-slots', mid);
+    this.weaponSlotEls = {} as Record<WeaponId, HTMLElement>;
+    for (const wid of WEAPON_ORDER) {
+      this.weaponSlotEls[wid] = el('w-slot', slotsWrap, WEAPON_SHORT[wid]);
+    }
+
     const right = el('dock-right', this.dock);
     el('credits-label', right, 'Tactical credits');
     this.creditsText = el('credits mono', right, '0');
-    el('hints', right, 'WASD Move · Shift Sprint · Q/E Lean · RMB Aim · R Reload · B Bench · T Searchlight · H Dock');
+    el('hints', right, '1–6 Weapons · WASD/Shift Move · Q/E Lean · RMB Aim · F Interact · B Bench · T Light · M Synth');
 
     // ---- banner ----
     this.banner = el('banner', this.root);
@@ -151,22 +209,21 @@ export class Hud {
     // ---- brief ----
     this.brief = el('overlay', this.root);
     const briefCard = el('card', this.brief);
-    el('card-kicker', briefCard, 'OUTPOST ZERO // SIGNAL HOLD');
-    el('card-title', briefCard, 'Alpine Radio Outpost · Night Defense');
+    el('card-kicker', briefCard, 'OUTPOST ZERO // SIGNAL HOLD — 8-THEATER CAMPAIGN');
+    el('card-title', briefCard, 'Tactical Defense & Orbital Uplink');
     el(
       'card-body',
       briefCard,
-      'Elevation 3,800 m. The transmitter is ready — once the distress uplink to the orbital satellite begins, its raw electromagnetic radiation will draw a swarm of rogue combat drones out of the valley. Hold the outpost through five waves, manage transmitter overheat crises, and keep the uplink running until it reaches 100%.',
+      'Hold the perimeter across 8 extreme environments while the orbital distress uplink charges to 100%. Complete dynamic mid-battle directives, intercept specialized supply drops (Munitions, Nano-Med, Auto-Sentry Turrets, EMP Overcharge, Prototype Ordnance), and upgrade 6 distinct tactical weapons.',
     );
     const keys = el('keygrid', briefCard);
     const keyLines = [
       ['WASD / Shift', 'Move · Sprint'],
       ['Q / E', 'Lean at cover'],
       ['LMB / RMB', 'Fire / Precision aim'],
-      ['1 / 2 / 3 / 4 · Wheel', 'Pistol / Rifle / Shotgun / Vulcan SAM'],
-      ['F', 'Repair · Resupply · Airdrop · Searchlight'],
-      ['B', 'Weapon mod bench'],
-      ['T · H', 'Searchlight on/off · Collapse dock'],
+      ['1–6 / Wheel', 'Pistol · Rifle · Shotgun · Plasma · SAM · Railgun'],
+      ['F', 'Repair · Airdrop · Relay · Turret · Coolant'],
+      ['B / T / M / H', 'Mod Bench · Searchlight · Combat Synth · Dock'],
     ];
     for (const [k, v] of keyLines) {
       const row = el('keyrow', keys);
@@ -176,23 +233,30 @@ export class Hud {
     el(
       'map-blurb',
       briefCard,
-      'Five-hold campaign. Clear a level and your rank, upgrades, credits and hardened vitals carry forward to the next — the swarm gets heavier and stranger with every map. You only re-deploy from Level 1 if the line collapses.',
+      'Select any theater below to preview its environment and deploy directly, or start at Level 1 and carry your rank, credits, and weapon mods through all eight sectors:',
     );
     const levelList = el('level-list', briefCard);
     LEVELS.forEach((lv, i) => {
-      const row = el(`lv-row${i === 0 ? '' : ' locked'}`, levelList);
-      el('lv-title mono', row, `LEVEL ${i + 1} · ${lv.name}`);
+      const row = el(`lv-row${i === 0 ? ' selected' : ''}`, levelList);
+      el('lv-title mono', row, `L${i + 1} · ${lv.name}`);
       el('lv-sub', row, [lv.timeOfDay, lv.newThreats].filter(Boolean).join(' · ') || 'Standard hostile mix');
+      row.addEventListener('click', () => {
+        this.selectedBriefLevel = i;
+        this.levelRows.forEach((r, idx) => r.classList.toggle('selected', idx === i));
+        this.deployBtn.textContent = `Deploy — LEVEL ${i + 1} · ${lv.name}`;
+        cb.onSelectPreviewLevel?.(i);
+      });
+      this.levelRows.push(row);
     });
-    const deployBtn = el('btn', briefCard, `Deploy — LEVEL 1 · ${LEVELS[0].name}`);
-    deployBtn.addEventListener('click', () => cb.onStart());
+    this.deployBtn = el('btn', briefCard, `Deploy — LEVEL 1 · ${LEVELS[0].name}`);
+    this.deployBtn.addEventListener('click', () => cb.onStart(this.selectedBriefLevel));
 
     // ---- upgrade ----
     this.upgrade = el('overlay', this.root);
     this.upgrade.style.display = 'none';
     const upCard = el('card wide', this.upgrade);
     el('card-kicker', upCard, 'TACTICAL WORKBENCH');
-    el('card-title', upCard, 'Weapon Mod Bench');
+    el('card-title', upCard, 'Armory & Weapon Mod Bench');
     this.upgradeBody = el('upgrade-body', upCard);
     const close = el('btn', upCard, 'Back to the line (B)');
     close.addEventListener('click', () => cb.onCloseUpgrade());
@@ -219,6 +283,11 @@ export class Hud {
     }
   }
 
+  setMusicState(on: boolean): void {
+    this.set('music', this.musicChip, on ? 'SYNTH ● (M)' : 'SYNTH ○ (M)');
+    this.musicChip.classList.toggle('lit', on);
+  }
+
   setTop(m: MissionState): void {
     const p = m.progress.toFixed(1);
     this.progressFill.style.width = `${m.progress}%`;
@@ -235,17 +304,65 @@ export class Hud {
     this.rankChip.classList.toggle('gold', m.level > 1);
   }
 
+  setObjective(obj: ActiveSubObjective | null): void {
+    if (!obj) {
+      if (this.objPanel.style.display !== 'none') this.objPanel.style.display = 'none';
+      return;
+    }
+    if (this.objPanel.style.display !== 'block') this.objPanel.style.display = 'block';
+    const urgent = obj.kind === 'jammer' || obj.timer < 12;
+    this.objPanel.classList.toggle('urgent', urgent);
+    this.set('objKicker', this.objKicker, obj.kind === 'jammer' ? '⚠ SIGNAL JAMMED' : 'TACTICAL DIRECTIVE');
+    this.set('objTimer', this.objTimer, `${Math.ceil(obj.timer)}s`);
+    this.set('objTitle', this.objTitle, obj.title);
+    this.set('objDesc', this.objDesc, obj.desc);
+    const pct = obj.kind === 'jammer' ? ((obj.hp ?? 0) / Math.max(1, obj.maxHp ?? 1)) * 100 : obj.progress * 100;
+    this.objFill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    this.objFill.className = `fill ${obj.kind === 'jammer' ? 'red' : 'cyan'}`;
+  }
+
+  setBuffs(m: MissionState, p: PlayerState, activeTurrets: number): void {
+    const tags: { text: string; cls: string }[] = [];
+    if (p.overchargeUntil > m.time) {
+      tags.push({ text: `⚡ WEAPON OVERCHARGE (${Math.ceil(p.overchargeUntil - m.time)}s)`, cls: 'buff-tag violet' });
+    }
+    if (p.regenUntil > m.time) {
+      tags.push({ text: `✚ NANO-REGEN (${Math.ceil(p.regenUntil - m.time)}s)`, cls: 'buff-tag green' });
+    }
+    if (m.signalBoostUntil > m.time) {
+      tags.push({ text: `▲ UPLINK SURGE 1.45x (${Math.ceil(m.signalBoostUntil - m.time)}s)`, cls: 'buff-tag' });
+    }
+    if (m.thermalShieldUntil > m.time) {
+      tags.push({ text: `❄ CRYO THERMAL LOCK (${Math.ceil(m.thermalShieldUntil - m.time)}s)`, cls: 'buff-tag' });
+    }
+    if (activeTurrets > 0) {
+      tags.push({ text: `◈ AUTO-SENTRY TURRETS ×${activeTurrets}`, cls: 'buff-tag amber' });
+    }
+    const key = tags.map((t) => t.text).join('|');
+    if (this.lastValues.get('buffs') === key) return;
+    this.lastValues.set('buffs', key);
+    this.buffStrip.textContent = '';
+    for (const t of tags) {
+      el(t.cls, this.buffStrip, t.text);
+    }
+  }
+
   setMap(name: string): void {
     this.set('map', this.mapChip, name);
   }
 
-  setWeapon(id: WeaponId, mag: number, reserve: number, reloading: boolean, rank = 1): void {
+  setWeapon(id: WeaponId, mag: number, reserve: number, reloading: boolean, rank = 1, locked?: Set<WeaponId>): void {
     const tier = weaponTier(rank);
     this.set('wname', this.weaponName, tier > 0 ? `${WEAPONS[id].name} Mk ${['I', 'II', 'III'][tier - 1]}` : WEAPONS[id].name);
     this.set('mag', this.ammoMag, `${mag}`);
     this.set('res', this.ammoReserve, `${reserve}`);
     this.ammoMag.classList.toggle('low', mag === 0);
     this.reloadHint.style.display = reloading ? 'block' : 'none';
+    for (const wid of WEAPON_ORDER) {
+      const slotEl = this.weaponSlotEls[wid];
+      slotEl.classList.toggle('active', wid === id);
+      if (locked) slotEl.classList.toggle('locked', locked.has(wid));
+    }
   }
 
   setVitals(hp: number, armor: number, credits: number, maxHp = 100): void {
@@ -318,14 +435,30 @@ export class Hud {
     this.dock.classList.toggle('collapsed');
   }
 
-  renderUpgrade(credits: number, runtimes: Record<WeaponId, WeaponRuntime>, onBuy: HudCallbacks['onBuy'], hasLauncher = false): void {
+  renderUpgrade(
+    credits: number,
+    runtimes: Record<WeaponId, WeaponRuntime>,
+    onBuy: HudCallbacks['onBuy'],
+    locked: Set<WeaponId> = new Set(),
+    onUnlockWeapon?: (w: WeaponId) => void,
+  ): void {
     this.upgradeBody.textContent = '';
     el('upgrade-credits mono', this.upgradeBody, `Credits on hand: ${credits}`);
-    const ids: WeaponId[] = hasLauncher ? ['pistol', 'rifle', 'shotgun', 'launcher'] : ['pistol', 'rifle', 'shotgun'];
-    for (const id of ids) {
+    for (const id of WEAPON_ORDER) {
+      const isLocked = locked.has(id);
       const row = el('up-row', this.upgradeBody);
       el('up-weapon', row, WEAPON_LABELS[id]);
       const tracks = el('up-tracks', row);
+      if (isLocked) {
+        const unlockCost = id === 'plasma' ? 60 : id === 'launcher' ? 85 : 110;
+        const btn = document.createElement('button');
+        btn.className = 'up-buy mono';
+        btn.textContent = `Field Unlock (${unlockCost} CR) — or auto-unlock in later sector`;
+        btn.disabled = credits < unlockCost;
+        btn.addEventListener('click', () => onUnlockWeapon?.(id));
+        tracks.appendChild(btn);
+        continue;
+      }
       for (const tr of TRACKS) {
         const cell = el('up-cell', tracks);
         el('up-track-name', cell, tr.label);
@@ -369,18 +502,16 @@ export class Hud {
       ['Final progress', `${m.progress.toFixed(1)}%`],
       ['Waves held', `${Math.max(1, m.wave)} / 5`],
       ['Time survived', `${mins}:${String(secs).padStart(2, '0')}`],
-      ['Scouts downed', `${stats.kills.scout}`],
-      ['Heavies downed', `${stats.kills.heavy}`],
-      ['Kamikazes downed', `${stats.kills.kamikaze}`],
+      ['Tactical directives', `${stats.objectivesCompleted}`],
+      ['Supply pods claimed', `${stats.airdrops}`],
       ['Accuracy', `${acc}%`],
-      ['Overheat crises', `${stats.overheatEvents} / repairs ${stats.repairs}`],
+      ['Scouts / Heavies', `${stats.kills.scout} / ${stats.kills.heavy}`],
+      ['Kamikazes / Bombers', `${stats.kills.kamikaze} / ${stats.kills.bomber}`],
+      ['Wardens / Crawlers', `${stats.kills.warden} / ${stats.kills.crawler}`],
+      ['Phantoms / Shielders', `${stats.kills.phantom} / ${stats.kills.shielder}`],
+      ['Colossi / Titans', `${stats.kills.colossus} / ${stats.kills.titan}`],
+      ['Overheat / Repairs', `${stats.overheatEvents} / ${stats.repairs}`],
     ];
-    if (stats.kills.warden > 0 || stats.kills.bomber > 0) {
-      lines.push(['Wardens downed', `${stats.kills.warden}`], ['Bombers downed', `${stats.kills.bomber}`]);
-    }
-    if (stats.kills.crawler > 0 || stats.kills.colossus > 0) {
-      lines.push(['Crawlers downed', `${stats.kills.crawler}`], ['Colossi downed', `${stats.kills.colossus}`]);
-    }
     for (const [k, v] of lines) {
       const r = el('statrow', grid);
       el('k', r, k);
@@ -389,7 +520,7 @@ export class Hud {
     if (won && nextLabel) {
       const adv = el('btn', this.endBody, `ADVANCE — ${nextLabel}`);
       adv.addEventListener('click', () => this.advanceCb?.());
-      const again = el('btn ghost', this.endBody, 'Restart campaign from Level 1');
+      const again = el('btn ghost', this.endBody, 'Return to Theater Select');
       again.addEventListener('click', () => this.restartCb?.());
     } else {
       const btn = el('btn', this.endBody, won ? 'Campaign complete — redeploy' : 'Redeploy');

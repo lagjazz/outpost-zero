@@ -131,6 +131,50 @@ export function buildRailYard(scene: THREE.Scene): WorldBundle {
     group.add(lamp);
   }
 
+  // Armored Diesel-Electric Locomotive at the head of the north track
+  const loco = new THREE.Group();
+  const locoBody = new THREE.Mesh(new THREE.BoxGeometry(12.5, 3.6, 2.8), steel(0x1f2d3d, 0.65));
+  locoBody.position.y = 2.3;
+  locoBody.castShadow = true;
+  loco.add(locoBody);
+  const locoCab = new THREE.Mesh(new THREE.BoxGeometry(3.6, 1.4, 2.75), steel(0x28384c, 0.6));
+  locoCab.position.set(3.2, 4.4, 0);
+  loco.add(locoCab);
+  const cabGlass = new THREE.Mesh(
+    new THREE.BoxGeometry(0.15, 0.7, 2.3),
+    new THREE.MeshStandardMaterial({ color: 0x111827, emissive: new THREE.Color('#38bdf8'), emissiveIntensity: 1.1 }),
+  );
+  cabGlass.position.set(5.02, 4.45, 0);
+  loco.add(cabGlass);
+  const headlight = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.32, 0.32, 0.2, 12),
+    new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: new THREE.Color('#fde047'), emissiveIntensity: 3.0 }),
+  );
+  headlight.rotation.z = Math.PI / 2;
+  headlight.position.set(6.3, 3.1, 0);
+  loco.add(headlight);
+  const plow = new THREE.Mesh(new THREE.ConeGeometry(1.6, 1.8, 4), steel(0xb45309, 0.7));
+  plow.rotation.z = -Math.PI / 2;
+  plow.rotation.x = Math.PI / 4;
+  plow.position.set(6.9, 0.9, 0);
+  loco.add(plow);
+  loco.position.set(-37, 0, -17);
+  group.add(loco);
+  colliders.push({ kind: 'box', x: -37, z: -17, hx: 6.5, hz: 1.5, r: 0, top: 4.8 });
+
+  // Railway signal semaphores with glowing green/amber lenses
+  for (const [sx, sz, col] of [[-16, -14.2, '#10b981'], [11, 10.2, '#f59e0b'], [-29, 16.2, '#ef4444']] as const) {
+    const post = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.1, 5.2, 6), steel(0x2b3442));
+    post.position.set(sx, 2.6, sz);
+    group.add(post);
+    const lens = new THREE.Mesh(
+      new THREE.SphereGeometry(0.22, 8, 8),
+      new THREE.MeshStandardMaterial({ color: 0x111111, emissive: new THREE.Color(col), emissiveIntensity: 2.5 }),
+    );
+    lens.position.set(sx, 4.9, sz);
+    group.add(lens);
+  }
+
   // distant hills silhouette
   const hillMat = new THREE.MeshStandardMaterial({ color: 0x141118, roughness: 1, fog: true });
   for (let i = 0; i < 10; i++) {

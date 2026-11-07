@@ -2,6 +2,8 @@
 import * as THREE from 'three';
 import type { Interactable } from './state';
 
+const _to = new THREE.Vector3();
+
 export class InteractSystem {
   items: Interactable[];
   private byId = new Map<string, Interactable>();
@@ -30,10 +32,10 @@ export class InteractSystem {
     let bestScore = -Infinity;
     for (const it of this.items) {
       if (it.readyAt > time) continue;
-      const to = it.pos.clone().sub(camPos);
-      const dist = to.length();
-      if (dist > range) continue;
-      const dot = to.normalize().dot(facing);
+      _to.subVectors(it.pos, camPos);
+      const dist = _to.length();
+      if (dist > range || dist < 1e-5) continue;
+      const dot = _to.multiplyScalar(1 / dist).dot(facing);
       // right next to a facility, looking down at it should still focus it
       if (dot < (dist < 1.6 ? -0.25 : 0.35)) continue;
       const score = dot * 2 - dist * 0.15;

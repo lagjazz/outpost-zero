@@ -1,7 +1,7 @@
-// Outpost Zero — game bootstrap & per-frame orchestration (five-level campaign).
+// Outpost Zero — game bootstrap & per-frame orchestration (eight-level campaign).
 import * as THREE from 'three';
-import { AUTOLEVEL, BOMB_BLAST, DRONES, LEVELS, LIGHT_BUDGET, MISSION, PLAYER, ROCKET, UPGRADE, WEAPONS, weaponTier } from './config';
-import { Engine } from './engine';
+import { AIRDROP_SPECS, AUTOLEVEL, BOMB_BLAST, DRONES, LEVELS, LIGHT_BUDGET, MISSION, PLAYER, ROCKET, UPGRADE, WEAPONS, weaponTier } from './config';
+import { Engine, isSoftwareGl } from './engine';
 import { AudioWorld } from './audio';
 import { buildWorld, type WorldBundle } from './world';
 import { LightRig } from './lightRig';
@@ -9,6 +9,9 @@ import { buildCanyon } from './canyon';
 import { buildRailYard } from './rail';
 import { buildDam } from './dam';
 import { buildCrater } from './crater';
+import { buildHarbor } from './harbor';
+import { buildBiolab } from './biolab';
+import { buildCitadel } from './citadel';
 import { buildOutpost } from './outpost';
 import { PlayerController } from './player';
 import { WeaponSystem } from './weapons';
@@ -17,17 +20,20 @@ import { Effects } from './effects';
 import { Weather } from './weather';
 import { WaveDirector } from './waves';
 import { InteractSystem } from './interact';
+import { TacticalDirector } from './objectives';
 import { Hud } from './hud';
 import {
   createMissionState,
   createPlayerState,
   createWeaponRuntimes,
   effectiveWeapon,
+  type AirdropKind,
   type Collider,
   type DroneKind,
   type Interactable,
   type MapId,
   type MissionState,
+  type SubObjectiveKind,
   type UpgradeLevels,
   type WeaponId,
 } from './state';
@@ -50,6 +56,16 @@ interface Rocket {
 }
 
 const ROCKET_POOL = 12;
+const _upAxis = new THREE.Vector3(0, 1, 0);
+const _camDir = new THREE.Vector3();
+const _rayEnd = new THREE.Vector3();
+const _prevPos = new THREE.Vector3();
+const _velDir = new THREE.Vector3();
+const _toVec = new THREE.Vector3();
+const _desiredVel = new THREE.Vector3();
+const _segAB = new THREE.Vector3();
+const _segAP = new THREE.Vector3();
+const _segClosest = new THREE.Vector3();
 
 class Game {
   private engine: Engine;
@@ -67,18 +83,20 @@ class Game {
   private weather: Weather;
   private waves: WaveDirector;
   private interact: InteractSystem;
+  private tactical: TacticalDirector;
   private hud: Hud;
   private outpost: ReturnType<typeof buildOutpost>;
   private mapRuntimes: MapRuntime[];
   private levelIdx = 0;
   private staticProxies: THREE.Mesh[] = [];
   private groundMesh!: THREE.Mesh;
+  private sharedRaycaster = new THREE.Raycaster();
+  private rayTargets: THREE.Object3D[] = [];
+  private enemyPositions: THREE.Vector3[] = [];
 
   private rockets: Rocket[] = [];
   private rocketGeo = new THREE.ConeGeometry(0.09, 0.5, 6);
   private rocketMat = new THREE.MeshBasicMaterial({ color: new THREE.Color('#ffd9a0'), blending: THREE.AdditiveBlending, transparent: true, fog: false });
-  // pre-built hidden rocket meshes: their program/geometry warm up at boot, and
-  // firing only re-arms a slot (no allocation, no first-use compile).
   private rocketPool: THREE.Mesh[] = [];
   private rocketFree: number[] = [];
 
@@ -106,13 +124,16 @@ class Game {
       onBeep: (p) => this.audio.proximityBeep(p),
     });
 
-    // all five level maps are built up front; only the active one is visible
+    // all eight level maps are built up front; only the active one is visible
     const builders: Record<MapId, (s: THREE.Scene) => WorldBundle> = {
       alpine: buildWorld,
       canyon: buildCanyon,
       rail: buildRailYard,
       dam: buildDam,
       crater: buildCrater,
+      harbor: buildHarbor,
+      biolab: buildBiolab,
+      citadel: buildCitadel,
     };
     this.mapRuntimes = LEVELS.map((def, i) => this.makeMapRuntime(i, builders[def.id](scene), buildOutpost(scene, def.layout)));
 
@@ -123,12 +144,9 @@ class Game {
     this.controller = new PlayerController(this.engine.camera, this.mapRuntimes[0].colliders, this.player);
     this.weapons = new WeaponSystem(this.engine.camera, this.runtimes, this.audio);
     this.interact = new InteractSystem(this.outpost.interactables);
+    this.tactical = new TacticalDirector(scene, this.drones, this.effects, this.audio);
     this.engine.setAmbience(LEVELS[0].ambience);
 
-    // Constant light budget (see lightRig.ts). The five maps stack their lamps on
-    // the same ground and airdrop pods add lights at runtime, so the scene's light
-    // count used to change on level switches and pod spawns — each change re-keys
-    // every shader program, which is the freeze people feel in the first minutes.
     this.lightRig = new LightRig(scene, LIGHT_BUDGET);
     console.log(`[lights] ${this.lightRig.collect()} fixtures -> pool of ${this.lightRig.budget}`);
     for (let i = 0; i < ROCKET_POOL; i++) {
@@ -146,11 +164,14 @@ class Game {
     };
 
     this.hud = new Hud({
-      onStart: () => this.startLevel(0),
+      onStart: (levelIdx = 0) => this.startLevel(levelIdx),
+      onSelectPreviewLevel: (levelIdx) => this.previewLevel(levelIdx),
       onBuy: (w, t) => this.buyUpgrade(w, t),
+      onUnlockWeapon: (w) => this.fieldUnlockWeapon(w),
       onCloseUpgrade: () => this.closeUpgrade(),
       onRestart: () => location.reload(),
       onResume: () => this.requestLock(),
+      onToggleMusic: () => this.audio.toggleMusic(),
     });
     this.hud.restartCb = () => location.reload();
     this.hud.setPhase('brief');
@@ -159,52 +180,59 @@ class Game {
     (window as unknown as { __outpost: unknown }).__outpost = this.debugHooks();
 
     let last = performance.now();
+    const scheduleNext = isSoftwareGl
+      ? (fn: (now: number) => void) => this.engine.afterDraw(() => fn(performance.now()))
+      : (fn: (now: number) => void) => requestAnimationFrame(fn);
+
     const loop = (now: number) => {
-      // dt is clamped below, so the in-game FPS readout caps at 20 and cannot show
-      // a stall; frameGaps keeps the true gap for __outpost.prof().
       this.frameGaps.push(now - last);
       if (this.frameGaps.length > 240) this.frameGaps.shift();
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
       this.update(dt);
-      requestAnimationFrame(loop);
+      scheduleNext(loop);
     };
     requestAnimationFrame(loop);
   }
 
   // ---------- warm-up ----------
 
-  /** Compile every program and upload every texture behind the brief screen.
-   *  compile() walks the whole scene graph (visibility-agnostic for materials),
-   *  so all five maps warm up while only the active map's lights are counted —
-   *  nothing is drawn, so the maps never visibly stack. Without this, each
-   *  map's materials compile the first time it is seen: a freeze mid-wave. */
-  /** Every hostile is built from scratch the first time it spawns - BUILDERS[kind]
-   *  makes fresh geometry and materials per drone, seven kinds in a normal run -
-   *  so wave 1 pays seven shader compiles plus buffer uploads while you are
-   *  already shooting. Build one of each in front of the camera, force them
-   *  through compile + render here (same tick as boot, so nothing ever paints
-   *  them and their AI never runs), then drop them. */
   private warmHostiles(): void {
-    const kinds: DroneKind[] = ['scout', 'heavy', 'kamikaze', 'warden', 'bomber', 'crawler', 'colossus'];
+    const kinds: DroneKind[] = [
+      'scout',
+      'heavy',
+      'kamikaze',
+      'warden',
+      'bomber',
+      'crawler',
+      'colossus',
+      'phantom',
+      'shielder',
+      'titan',
+    ];
     const keep = this.drones.drones.length;
     const cam = this.engine.camera;
     const dir = new THREE.Vector3();
     cam.getWorldDirection(dir);
     kinds.forEach((kind, i) => {
-      const a = (i - (kinds.length - 1) / 2) * 0.3;
-      const pos = cam.position.clone().addScaledVector(dir, 24)
-        .add(new THREE.Vector3(-dir.z * Math.sin(a) * 24, 7 + i * 1.4, dir.x * Math.sin(a) * 24));
+      const a = (i - (kinds.length - 1) / 2) * 0.25;
+      const pos = cam.position
+        .clone()
+        .addScaledVector(dir, 24)
+        .add(new THREE.Vector3(-dir.z * Math.sin(a) * 24, 7 + i * 1.2, dir.x * Math.sin(a) * 24));
       this.drones.spawn(kind, pos);
     });
-    // Same pass uploads everything else: the five maps are stacked at one origin
-    // and toggled by group.visible, so a normal frame keeps four maps' geometry
-    // and the current map's off-screen geometry out of VRAM until you walk there.
     const hidden: THREE.Object3D[] = [];
     const culled: THREE.Object3D[] = [];
     this.engine.scene.traverse((obj) => {
-      if (!obj.visible) { obj.visible = true; hidden.push(obj); }
-      if (obj.frustumCulled) { obj.frustumCulled = false; culled.push(obj); }
+      if (!obj.visible) {
+        obj.visible = true;
+        hidden.push(obj);
+      }
+      if (obj.frustumCulled) {
+        obj.frustumCulled = false;
+        culled.push(obj);
+      }
     });
     this.engine.renderer.compile(this.engine.scene, cam);
     this.engine.render();
@@ -227,7 +255,6 @@ class Game {
     group.add(world.group, ob.root);
     this.engine.scene.add(group);
     const colliders = [...world.colliders, ...ob.colliders];
-    // static bullet-stop proxies per map (only the active map's proxies get raycast)
     const proxies: THREE.Mesh[] = [];
     const proxyMat = new THREE.MeshBasicMaterial({ visible: false });
     for (const c of colliders) {
@@ -239,9 +266,19 @@ class Game {
       group.add(m);
       proxies.push(m);
     }
-    group.visible = levelIdx === 0; // brief preview backdrop
+    group.visible = levelIdx === 0;
     const waves = new WaveDirector(this.engine.scene, this.drones, colliders, LEVELS[levelIdx].waves, world.spawnAngle);
     return { group, ground: world.ground, colliders, proxies, outpost: ob, waves };
+  }
+
+  /** Switch backdrop map while on the briefing screen so players can preview any theater. */
+  private previewLevel(i: number): void {
+    if (this.mission.phase !== 'brief') return;
+    const def = LEVELS[i];
+    if (!def) return;
+    this.mapRuntimes.forEach((rt, idx) => (rt.group.visible = idx === i));
+    this.engine.setAmbience(def.ambience);
+    this.hud.setMap(`L${i + 1} · ${def.name}`);
   }
 
   // ---------- campaign lifecycle ----------
@@ -249,8 +286,6 @@ class Game {
   /** Enter level i, carrying rank/credits/upgrades over and re-supplying fully. */
   private startLevel(i: number): void {
     const def = LEVELS[i];
-    // reset the per-level mission fields in place (the object identity is referenced
-    // by debug hooks & HUD) — score/rank/stats carry across the whole campaign
     const m = this.mission;
     m.time = 0;
     m.progress = 0;
@@ -261,6 +296,10 @@ class Game {
     m.searchlightOn = false;
     m.searchlightRuntime = 0;
     m.searchlightCooldownUntil = 0;
+    m.signalBoostUntil = 0;
+    m.thermalShieldUntil = 0;
+    m.activeObjective = null;
+    m.activeTurrets = 0;
     m.endReason = '';
     m.phase = 'brief';
     this.holdConsole = 0;
@@ -273,24 +312,42 @@ class Game {
     const rt = this.mapRuntimes[i];
     this.outpost = rt.outpost;
     this.waves = rt.waves;
+    this.waves.reset();
+    this.waves.clear();
     this.staticProxies = rt.proxies;
     this.groundMesh = rt.ground;
-    this.interact = new InteractSystem(this.outpost.interactables);
+    this.interact = new InteractSystem([...this.outpost.interactables]);
+    this.tactical.reset((id: string) => this.interact.remove(id));
     this.controller.setColliders(rt.colliders);
     this.drones.setColliders(rt.colliders);
     this.drones.setMods(def.hpMul, def.dmgMul);
     this.drones.clearHostiles();
     this.engine.setAmbience(def.ambience);
 
-    if (def.launcherUnlock && this.weapons.locked.has('launcher')) {
-      this.weapons.unlock('launcher');
-      this.hud.banner_show('Vulcan SAM acquired', 'Press 4 — shoulder-fired homing missile; resupply at ammo racks');
+    // Unlock weapons up to this level
+    for (let li = 0; li <= i; li++) {
+      const wUnlock = LEVELS[li].weaponUnlock;
+      if (wUnlock && this.weapons.locked.has(wUnlock)) {
+        this.weapons.unlock(wUnlock);
+      }
+    }
+
+    // If jumping directly to a later theater from brief, grant starting credits/rank floor so it's balanced
+    if (i > 0 && m.level < i) {
+      const targetRank = Math.min(AUTOLEVEL.maxLevel, i);
+      while (m.level < targetRank) {
+        m.level += 1;
+        this.player.maxHealth += AUTOLEVEL.hpPerLevel;
+      }
+      this.player.credits = Math.max(this.player.credits, i * 35);
     }
 
     // between-level refresh: vitals & ammo full, rank bonuses and upgrades intact
     this.player.pos.set(0, 0, 10);
     this.player.health = this.player.maxHealth;
     this.player.armor = PLAYER.maxArmor;
+    this.player.overchargeUntil = 0;
+    this.player.regenUntil = 0;
     for (const id of Object.keys(this.runtimes) as WeaponId[]) {
       const wr = this.runtimes[id];
       wr.mag = effectiveWeapon(id, wr.levels, m.level).magSize;
@@ -386,7 +443,13 @@ class Game {
           this.weapons.switchTo('shotgun');
           break;
         case 'Digit4':
+          this.weapons.switchTo('plasma');
+          break;
+        case 'Digit5':
           this.weapons.switchTo('launcher');
+          break;
+        case 'Digit6':
+          this.weapons.switchTo('railgun');
           break;
         case 'KeyR':
           this.weapons.startReload();
@@ -405,6 +468,11 @@ class Game {
         case 'KeyT':
           if (this.mission.phase === 'playing') this.toggleSearchlight();
           break;
+        case 'KeyM': {
+          const on = this.audio.toggleMusic();
+          this.hud.setMusicState(on);
+          break;
+        }
       }
     });
     document.addEventListener('keyup', (e) => {
@@ -429,7 +497,23 @@ class Game {
   }
 
   private renderUpgradePanel(): void {
-    this.hud.renderUpgrade(this.player.credits, this.runtimes, (w, t) => this.buyUpgrade(w, t), !this.weapons.locked.has('launcher'));
+    this.hud.renderUpgrade(
+      this.player.credits,
+      this.runtimes,
+      (w, t) => this.buyUpgrade(w, t),
+      this.weapons.locked,
+      (w) => this.fieldUnlockWeapon(w),
+    );
+  }
+
+  private fieldUnlockWeapon(weapon: WeaponId): void {
+    if (!this.weapons.locked.has(weapon)) return;
+    const cost = weapon === 'plasma' ? 60 : weapon === 'launcher' ? 85 : 110;
+    if (this.player.credits < cost) return;
+    this.player.credits -= cost;
+    this.weapons.unlock(weapon);
+    this.audio.levelUp();
+    this.renderUpgradePanel();
   }
 
   private buyUpgrade(weapon: WeaponId, track: keyof UpgradeLevels): void {
@@ -446,7 +530,6 @@ class Game {
 
   // ---------- auto rank ----------
 
-  /** Kill score drives automatic rank-ups (separate from spendable credits). */
   private addScore(n: number): void {
     const m = this.mission;
     m.score += n;
@@ -467,60 +550,145 @@ class Game {
 
   // ---------- combat ----------
 
+  private buildRayTargets(): THREE.Object3D[] {
+    const droneMeshes = this.drones.hitMeshes();
+    this.rayTargets.length = 0;
+    for (let i = 0; i < droneMeshes.length; i++) this.rayTargets.push(droneMeshes[i]);
+    if (this.tactical.activeObj?.hitMesh) this.rayTargets.push(this.tactical.activeObj.hitMesh);
+    for (let i = 0; i < this.staticProxies.length; i++) this.rayTargets.push(this.staticProxies[i]);
+    this.rayTargets.push(this.groundMesh);
+    return this.rayTargets;
+  }
+
   private fire(): void {
-    const shot = this.weapons.tryFire(this.player, this.controller.planarSpeed() > 1.5);
+    const overcharged = this.player.overchargeUntil > this.mission.time;
+    const shot = this.weapons.tryFire(this.player, this.controller.planarSpeed() > 1.5, this.mission.time);
     if (!shot) return;
     this.mission.stats.shotsFired += 1;
     this.mission.stats.pelletsFired += shot.dirs.length;
+    const curWep = this.weapons.current;
 
-    if (this.weapons.current === 'launcher') {
+    if (curWep === 'launcher') {
       const dir = shot.dirs[0];
       const slot = this.takeRocketSlot();
       const mesh = this.rocketPool[slot];
       mesh.position.copy(shot.muzzleWorld);
-      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+      mesh.quaternion.setFromUnitVectors(_upAxis, dir);
       mesh.visible = true;
       this.rockets.push({ slot, mesh, vel: dir.clone().multiplyScalar(ROCKET.speed), life: 8, direct: shot.damage });
       this.effects.flash(shot.muzzleWorld, '#ffb27f', 26, 6, 0.12);
+    } else if (curWep === 'railgun') {
+      // Piercing electromagnetic slug: hits every drone along the ray up to range or first solid world hit
+      const from = this.engine.camera.position;
+      const dir = shot.dirs[0];
+      this.sharedRaycaster.set(from, dir);
+      this.sharedRaycaster.far = shot.range;
+      const hits = this.sharedRaycaster.intersectObjects(this.buildRayTargets(), false);
+      const hitDrones = new Set<Drone>();
+      let stopDist = shot.range;
+      for (const h of hits) {
+        const ud = h.object.userData as { drone?: Drone; part?: string };
+        if (ud.part === 'world' || h.object === this.groundMesh) {
+          stopDist = h.distance;
+          this.effects.sparks(h.point, 'cyan', 8);
+          break;
+        }
+        if (ud.part === 'jammer') {
+          this.tactical.damageJammer(
+            shot.damage * 1.25,
+            (id) => this.interact.remove(id),
+            (k, p) => this.onCompleteObjective(k, p),
+          );
+          this.effects.sparks(h.point, 'violet', 10);
+          this.audio.critHit();
+          continue;
+        }
+        if (ud.drone && ud.part && !hitDrones.has(ud.drone)) {
+          hitDrones.add(ud.drone);
+          const res = this.drones.applyDamage(ud.drone, ud.part, shot.damage, 1.35);
+          this.mission.stats.pelletsHit += 1;
+          this.effects.sparks(h.point, 'violet', 10);
+          this.effects.shockwave(h.point, '#a855f7', 2.4);
+          if (res.crit) this.audio.critHit();
+          else this.audio.hitTick();
+          if (res.killed) this.audio.killConfirm();
+        }
+      }
+      _rayEnd.copy(from).addScaledVector(dir, stopDist);
+      this.effects.tracer(shot.muzzleWorld, _rayEnd, '#c084fc', 0.14);
+      this.effects.arcBeam(shot.muzzleWorld, _rayEnd, '#38bdf8');
     } else {
       const from = this.engine.camera.position;
-      const ray = new THREE.Raycaster();
-      const targets = [...this.drones.hitMeshes(), ...this.staticProxies, this.groundMesh];
+      const targets = this.buildRayTargets();
+      const isPlasma = curWep === 'plasma';
+      const tracerCol = isPlasma ? '#38bdf8' : overcharged ? '#c084fc' : '#ffd27f';
       for (const dir of shot.dirs) {
-        ray.set(from, dir);
-        ray.far = shot.range;
-        const hits = ray.intersectObjects(targets, false);
+        this.sharedRaycaster.set(from, dir);
+        this.sharedRaycaster.far = shot.range;
+        const hits = this.sharedRaycaster.intersectObjects(targets, false);
         const hit = hits[0];
         if (hit) {
           const ud = hit.object.userData as { drone?: Drone; part?: string };
           const end = hit.point;
-          this.effects.tracer(shot.muzzleWorld, end, '#ffd27f', 0.06);
-          if (ud.drone && ud.part) {
-            const res = this.drones.applyDamage(ud.drone, ud.part, shot.damage);
+          this.effects.tracer(shot.muzzleWorld, end, tracerCol, isPlasma ? 0.09 : 0.06);
+          if (isPlasma) this.effects.arcBeam(shot.muzzleWorld, end, '#38bdf8');
+          if (ud.part === 'jammer') {
+            this.tactical.damageJammer(
+              shot.damage,
+              (id) => this.interact.remove(id),
+              (k, p) => this.onCompleteObjective(k, p),
+            );
+            this.effects.sparks(end, isPlasma ? 'cyan' : 'amber', 6);
+            this.audio.hitTick();
+          } else if (ud.drone && ud.part) {
+            const res = this.drones.applyDamage(ud.drone, ud.part, shot.damage, isPlasma ? 1.85 : 1);
             this.mission.stats.pelletsHit += 1;
             if (ud.part === 'shield') {
               this.effects.shieldRipple(end);
               this.audio.shieldZap();
             } else {
-              this.effects.sparks(end, ud.part === 'weak' ? 'red' : 'amber', 6);
-              this.audio.hitTick();
+              this.effects.sparks(end, ud.part === 'weak' ? 'red' : isPlasma ? 'cyan' : 'amber', 6);
+              if (res.crit) this.audio.critHit();
+              else this.audio.hitTick();
+            }
+            if (res.killed) this.audio.killConfirm();
+
+            // Helios Plasma Carbine chains an electric arc to a nearby hostile within 7.5m
+            if (isPlasma) {
+              let chainTarget: Drone | null = null;
+              let bestD = 7.5;
+              for (const other of this.drones.drones) {
+                if (other === ud.drone || other.dying) continue;
+                const d = other.group.position.distanceTo(end);
+                if (d < bestD) {
+                  bestD = d;
+                  chainTarget = other;
+                }
+              }
+              if (chainTarget) {
+                this.effects.arcBeam(end, chainTarget.group.position, '#38bdf8');
+                this.drones.applyDamage(chainTarget, 'body', shot.damage * 0.55, 1.8);
+                this.audio.plasmaArc();
+              }
             }
           } else if (ud.part === 'world') {
-            this.effects.sparks(end, 'amber', 3);
+            this.effects.sparks(end, isPlasma ? 'cyan' : 'amber', 3);
           } else {
-            this.effects.sparks(end, 'amber', 2);
+            this.effects.sparks(end, isPlasma ? 'cyan' : 'amber', 2);
           }
         } else {
-          const end = from.clone().addScaledVector(dir, shot.range);
-          this.effects.tracer(shot.muzzleWorld, end, '#ffd27f', 0.06);
+          _rayEnd.copy(from).addScaledVector(dir, shot.range);
+          this.effects.tracer(shot.muzzleWorld, _rayEnd, tracerCol, isPlasma ? 0.09 : 0.06);
         }
       }
     }
     this.controller.addRecoil(
-      THREE.MathUtils.degToRad(WEAPONS[this.weapons.current].recoilPitchDeg),
-      THREE.MathUtils.degToRad(WEAPONS[this.weapons.current].recoilYawDeg),
+      THREE.MathUtils.degToRad(WEAPONS[curWep].recoilPitchDeg),
+      THREE.MathUtils.degToRad(WEAPONS[curWep].recoilYawDeg),
     );
-    this.controller.addTrauma(this.weapons.current === 'shotgun' ? 0.35 : this.weapons.current === 'launcher' ? 0.4 : 0.12);
+    this.controller.addTrauma(
+      curWep === 'shotgun' || curWep === 'railgun' ? 0.36 : curWep === 'launcher' ? 0.4 : 0.12,
+    );
   }
 
   // ---------- Vulcan SAM rockets ----------
@@ -533,7 +701,6 @@ class Game {
     this.rockets.length = 0;
   }
 
-  /** Free rocket slot, stealing the oldest in-flight rocket when saturated. */
   private takeRocketSlot(): number {
     const i = this.rocketFree.pop();
     if (i !== undefined) return i;
@@ -543,12 +710,12 @@ class Game {
     return this.rocketFree.pop()!;
   }
 
-  /** Closest distance from point p to segment a→b. */
   private static pointSegDist(p: THREE.Vector3, a: THREE.Vector3, b: THREE.Vector3): number {
-    const ab = b.clone().sub(a);
-    const len2 = ab.lengthSq();
-    const t = len2 <= 1e-9 ? 0 : THREE.MathUtils.clamp(p.clone().sub(a).dot(ab) / len2, 0, 1);
-    return a.clone().addScaledVector(ab, t).distanceTo(p);
+    _segAB.subVectors(b, a);
+    const len2 = _segAB.lengthSq();
+    _segAP.subVectors(p, a);
+    const t = len2 <= 1e-9 ? 0 : THREE.MathUtils.clamp(_segAP.dot(_segAB) / len2, 0, 1);
+    return _segClosest.copy(a).addScaledVector(_segAB, t).distanceTo(p);
   }
 
   private solidWorldPoint(p: THREE.Vector3): boolean {
@@ -572,43 +739,55 @@ class Game {
       if (dist > ROCKET.blastRadius + d.radius) continue;
       const falloff = Math.max(0, 1 - Math.max(0, dist - d.radius) / ROCKET.blastRadius);
       const directHit = dist < d.radius + ROCKET.fuseRadius ? direct : 0;
-      this.drones.applyDamage(d, 'body', directHit + blast * falloff);
+      const res = this.drones.applyDamage(d, 'body', directHit + blast * falloff);
+      if (res.killed) this.audio.killConfirm();
+    }
+    // Rockets also damage active jammer pylons if within blast radius
+    if (this.tactical.activeObj?.kind === 'jammer') {
+      const jDist = this.tactical.activeObj.pos.distanceTo(pos);
+      if (jDist < ROCKET.blastRadius + 2) {
+        this.tactical.damageJammer(
+          direct * 1.4,
+          (id) => this.interact.remove(id),
+          (k, p) => this.onCompleteObjective(k, p),
+        );
+      }
     }
   }
 
   private updateRockets(dt: number): void {
+    const cosLimit = Math.cos(THREE.MathUtils.degToRad(ROCKET.lockConeDeg));
     for (let i = this.rockets.length - 1; i >= 0; i--) {
       const r = this.rockets[i];
-      const prev = r.mesh.position.clone();
-      // acquire nearest hostile near the flight direction and curve toward it
+      _prevPos.copy(r.mesh.position);
       let target: Drone | null = null;
       let bestDist = Infinity;
-      const velDir = r.vel.clone().normalize();
-      const cosLimit = Math.cos(THREE.MathUtils.degToRad(ROCKET.lockConeDeg));
+      _velDir.copy(r.vel).normalize();
       for (const d of this.drones.drones) {
         if (d.dying) continue;
-        const to = d.group.position.clone().sub(r.mesh.position);
-        const dist = to.length();
-        if (dist > 120 || dist >= bestDist) continue;
-        if (dist > 4 && to.normalize().dot(velDir) < cosLimit) continue; // behind the launcher cone
+        _toVec.subVectors(d.group.position, r.mesh.position);
+        const dist = _toVec.length();
+        if (dist > 120 || dist >= bestDist || dist < 1e-4) continue;
+        if (dist > 4 && _toVec.multiplyScalar(1 / dist).dot(_velDir) < cosLimit) continue;
         target = d;
         bestDist = dist;
       }
       if (target) {
-        const desired = target.group.position.clone().sub(r.mesh.position).normalize().multiplyScalar(ROCKET.speed);
-        r.vel.lerp(desired, Math.min(1, dt * ROCKET.turnRate));
+        _desiredVel.subVectors(target.group.position, r.mesh.position).normalize().multiplyScalar(ROCKET.speed);
+        r.vel.lerp(_desiredVel, Math.min(1, dt * ROCKET.turnRate));
       }
       r.vel.setLength(ROCKET.speed);
       r.mesh.position.addScaledVector(r.vel, dt);
-      r.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), r.vel.clone().normalize());
+      _velDir.copy(r.vel).normalize();
+      r.mesh.quaternion.setFromUnitVectors(_upAxis, _velDir);
       r.life -= dt;
-      this.effects.tracer(prev, r.mesh.position, '#ffb27f', 0.05);
+      this.effects.tracer(_prevPos, r.mesh.position, '#ffb27f', 0.05);
 
       const p = r.mesh.position;
       let detonate = false;
       for (const d of this.drones.drones) {
         if (d.dying) continue;
-        if (Game.pointSegDist(d.group.position, prev, p) < d.radius + ROCKET.fuseRadius) {
+        if (Game.pointSegDist(d.group.position, _prevPos, p) < d.radius + ROCKET.fuseRadius) {
           detonate = true;
           break;
         }
@@ -624,7 +803,17 @@ class Game {
   }
 
   private onDroneExplosion(pos: THREE.Vector3, kind: DroneKind, killedByPlayer: boolean): void {
-    this.effects.explosion(pos, kind === 'heavy' || kind === 'colossus' ? 1.5 : kind === 'kamikaze' || kind === 'bomber' ? 1.4 : 0.9);
+    const tint: 'fire' | 'cyan' | 'violet' =
+      kind === 'phantom' || kind === 'titan' ? 'violet' : kind === 'shielder' ? 'cyan' : 'fire';
+    const scale =
+      kind === 'titan'
+        ? 2.2
+        : kind === 'heavy' || kind === 'colossus'
+          ? 1.5
+          : kind === 'kamikaze' || kind === 'bomber'
+            ? 1.4
+            : 0.9;
+    this.effects.explosion(pos, scale, tint);
     this.audio.explosion();
     if (killedByPlayer) {
       const reward = DRONES[kind].credits;
@@ -635,12 +824,11 @@ class Game {
     }
     const dmgMul = LEVELS[this.levelIdx].dmgMul;
     if (kind === 'bomber') {
-      // dropped bomb blast
       const d = this.player.pos.distanceTo(pos);
       if (d < BOMB_BLAST.radius) {
         this.damagePlayer(Math.round(BOMB_BLAST.maxDamage * dmgMul * Math.max(0, 1 - d / BOMB_BLAST.radius)), pos);
       }
-      if (this.outpost.towerPos.distanceTo(pos) < BOMB_BLAST.towerRadius) {
+      if (this.outpost.towerPos.distanceTo(pos) < BOMB_BLAST.towerRadius && this.mission.thermalShieldUntil <= this.mission.time) {
         this.mission.heat += BOMB_BLAST.towerHeat;
       }
       return;
@@ -649,7 +837,7 @@ class Game {
     const d = this.player.pos.distanceTo(pos);
     if (d < 6) this.damagePlayer(Math.round(76 * dmgMul * Math.max(0, 1 - d / 6)), pos);
     const towerDist = this.outpost.towerPos.distanceTo(pos);
-    if (towerDist < 7) {
+    if (towerDist < 7 && this.mission.thermalShieldUntil <= this.mission.time) {
       this.mission.heat += MISSION.kamikazeTowerHeat;
     }
   }
@@ -685,7 +873,7 @@ class Game {
     this.hud.restartCb = () => location.reload();
   }
 
-  // ---------- facilities ----------
+  // ---------- facilities, diverse airdrops & sub-objectives ----------
 
   private toggleSearchlight(): void {
     const m = this.mission;
@@ -700,8 +888,117 @@ class Game {
   }
 
   private refillAllAmmo(): void {
+    const m = this.mission;
     for (const id of Object.keys(this.runtimes) as WeaponId[]) {
-      this.runtimes[id].reserve = WEAPONS[id].reserveMax;
+      const wr = this.runtimes[id];
+      wr.mag = effectiveWeapon(id, wr.levels, m.level).magSize;
+      wr.reserve = WEAPONS[id].reserveMax;
+    }
+  }
+
+  private onClaimAirdrop(kind: AirdropKind, pos: THREE.Vector3): void {
+    const m = this.mission;
+    const p = this.player;
+    m.stats.airdrops += 1;
+    this.effects.shockwave(pos, AIRDROP_SPECS[kind].color, 4.5);
+
+    switch (kind) {
+      case 'munitions':
+        this.refillAllAmmo();
+        p.overchargeUntil = m.time + 16;
+        p.credits += 45;
+        this.audio.pickup();
+        this.hud.banner_show('MUNITIONS POD CLAIMED', 'All magazines & reserves full · +16s Weapon Overcharge (+35% DMG & ROF)');
+        break;
+      case 'medical':
+        p.maxHealth += 15;
+        p.health = p.maxHealth;
+        p.armor = PLAYER.maxArmor;
+        p.regenUntil = m.time + 22;
+        p.credits += 35;
+        this.audio.pickup();
+        this.hud.banner_show('NANO-MED POD CLAIMED', 'Max HP +15 · Full HP & Armor · +22s Nano-Regeneration');
+        break;
+      case 'sentry':
+        this.tactical.deployTurret(pos);
+        p.credits += 40;
+        this.audio.repairDone();
+        this.hud.banner_show('AUTO-SENTRY DEPLOYED', 'Autonomous twin-barrel defense turret active for 45s');
+        break;
+      case 'emp':
+        this.drones.empShockwave(pos, 48, 140);
+        this.effects.triggerEmp(pos);
+        m.heat = Math.max(0, m.heat - 45);
+        m.overheated = false;
+        this.audio.setAlarm(false);
+        this.audio.empBlast();
+        p.credits += 50;
+        this.hud.banner_show('CRYO-EMP SHOCKWAVE', 'All active drones blasted & stunned · Transmitter heat purged');
+        break;
+      case 'prototype': {
+        this.refillAllAmmo();
+        p.health = p.maxHealth;
+        p.armor = PLAYER.maxArmor;
+        p.credits += 90;
+        const lockedOrder: WeaponId[] = ['plasma', 'launcher', 'railgun'];
+        const nextWep = lockedOrder.find((w) => this.weapons.locked.has(w));
+        if (nextWep) {
+          this.weapons.unlock(nextWep);
+          this.weapons.switchTo(nextWep);
+          this.audio.levelUp();
+          this.hud.banner_show('PROTOTYPE ORDNANCE UNLOCKED', `${WEAPONS[nextWep].name} acquired + 90 Tactical Credits`);
+        } else {
+          p.overchargeUntil = m.time + 22;
+          this.audio.levelUp();
+          this.hud.banner_show('PROTOTYPE CORE OVERDRIVE', '+90 Tactical Credits · Full Resupply · +22s Overcharge');
+        }
+        break;
+      }
+    }
+  }
+
+  private onCompleteObjective(kind: SubObjectiveKind, pos: THREE.Vector3): void {
+    const m = this.mission;
+    const p = this.player;
+    m.stats.objectivesCompleted += 1;
+    this.audio.objectiveComplete();
+    this.effects.shockwave(pos, '#38bdf8', 5);
+
+    switch (kind) {
+      case 'jammer':
+        m.progress = Math.min(100, m.progress + 7);
+        p.credits += 60;
+        this.addScore(60);
+        this.hud.banner_show('JAMMER DESTROYED', 'Uplink restored · +7% Signal Surge · +60 Credits');
+        break;
+      case 'relay':
+        m.signalBoostUntil = m.time + 22;
+        p.credits += 55;
+        this.addScore(55);
+        this.hud.banner_show('AUXILIARY RELAY SYNCHRONIZED', '1.45x Uplink Speed for 22s · +55 Credits');
+        break;
+      case 'coolant':
+        m.heat = 0;
+        m.overheated = false;
+        m.thermalShieldUntil = m.time + 24;
+        this.audio.setAlarm(false);
+        p.credits += 50;
+        this.addScore(50);
+        this.hud.banner_show('CRYO THERMAL LOCK ENGAGED', 'Transmitter heat zeroed & locked for 24s · +50 Credits');
+        break;
+      case 'uplink_zone':
+        m.progress = Math.min(100, m.progress + 9);
+        p.overchargeUntil = m.time + 15;
+        p.credits += 65;
+        this.addScore(65);
+        this.hud.banner_show('TELEMETRY SYNC COMPLETE', '+9% Signal Surge · +15s Weapon Overcharge · +65 Credits');
+        break;
+      case 'hvt':
+        p.credits += 95;
+        this.addScore(95);
+        this.tactical.deployTurret(this.player.pos.clone());
+        this.hud.banner_show('COMMAND CARRIER ELIMINATED', '+95 Credits · Bonus Auto-Sentry Turret deployed');
+        break;
     }
   }
 
@@ -729,13 +1026,9 @@ class Game {
         this.audio.pickup();
         break;
       }
-      case 'airdrop': {
-        this.refillAllAmmo();
-        this.player.health = this.player.maxHealth;
-        this.player.armor = PLAYER.maxArmor;
-        this.player.credits += 40;
-        this.mission.stats.airdrops += 1;
-        this.audio.pickup();
+      case 'airdrop':
+      case 'relay_node':
+      case 'coolant_valve': {
         it.remove?.();
         break;
       }
@@ -752,7 +1045,7 @@ class Game {
 
   private victory(): void {
     if (this.mission.phase !== 'playing') return;
-    this.mission.phase = 'playing'; // keep simulating during EMP
+    this.mission.phase = 'playing';
     this.empTimer = 0;
     this.drones.killAll();
     this.effects.triggerEmp(this.outpost.towerPos);
@@ -790,14 +1083,27 @@ class Game {
       this.weapons.update(dt);
       this.engine.camera.userData.adsEase = this.player.ads;
 
+      // Nano-regeneration buff
+      if (this.player.regenUntil > m.time) {
+        this.player.health = Math.min(this.player.maxHealth, this.player.health + 4.5 * dt);
+        this.player.armor = Math.min(PLAYER.maxArmor, this.player.armor + 2.5 * dt);
+      }
+
       // firing
       if (this.firingHeld && (WEAPONS[this.weapons.current].auto || this.firePressedEdge)) this.fire();
 
       // mission simulation
       if (this.empTimer < 0) {
-        const rate = m.overheated ? 0 : this.waves.spawning ? MISSION.waveSignalRate : MISSION.baseSignalRate;
+        const jammed = this.tactical.activeObj?.kind === 'jammer';
+        const boostMult = m.signalBoostUntil > m.time ? 1.45 : 1.0;
+        const baseRate = m.overheated ? 0 : this.waves.spawning ? MISSION.waveSignalRate : MISSION.baseSignalRate;
+        const rate = baseRate * (jammed ? 0.35 : 1.0) * boostMult;
         m.progress = Math.min(100, m.progress + rate * dt);
-        if (!m.overheated) {
+
+        if (m.thermalShieldUntil > m.time) {
+          m.heat = Math.max(0, m.heat - MISSION.heatCool * 2 * dt);
+          m.overheated = false;
+        } else if (!m.overheated) {
           m.heat = Math.min(MISSION.overheatAt, m.heat + (MISSION.heatGain - MISSION.heatCool) * dt);
           if (m.heat >= MISSION.overheatAt) {
             m.overheated = true;
@@ -808,13 +1114,19 @@ class Game {
         } else {
           m.heat = Math.max(MISSION.overheatCoolTo - 4, m.heat - MISSION.heatCool * 0.6 * dt);
         }
+
         m.wave = this.waves.waveForProgress(m.progress);
         if (this.waves.waveBanner) {
           this.hud.banner_show(this.waves.waveBanner.title, this.waves.waveBanner.sub);
           this.waves.waveBanner = null;
         }
         this.waves.update(dt, m.progress);
-        this.waves.updateAirdrops(dt, (it) => this.interact.add(it), (id) => this.interact.remove(id));
+        this.waves.updateAirdrops(
+          dt,
+          (it) => this.interact.add(it),
+          (id) => this.interact.remove(id),
+          (a) => this.onClaimAirdrop(a.kind, a.pos),
+        );
       }
 
       // searchlight duty cycle
@@ -831,14 +1143,14 @@ class Game {
       }
 
       // searchlight marking
-      const enemyPos: THREE.Vector3[] = [];
+      this.enemyPositions.length = 0;
       for (const d of this.drones.drones) {
         if (d.dying) continue;
         if (m.searchlightOn && this.outpost.searchlight.isInBeam(d.group.position)) d.spotted = true;
         else d.spotted = false;
-        enemyPos.push(d.group.position);
+        this.enemyPositions.push(d.group.position);
       }
-      this.outpost.searchlight.update(dt, m.time, enemyPos, m.searchlightOn);
+      this.outpost.searchlight.update(dt, m.time, this.enemyPositions, m.searchlightOn);
 
       // drones
       this.drones.update(dt, m.time, this.player.pos, this.outpost.towerPos, true);
@@ -846,9 +1158,25 @@ class Game {
       // player rockets (Vulcan SAM)
       this.updateRockets(dt);
 
+      // update tactical director (sub-objectives + auto-sentry turrets)
+      const def = LEVELS[this.levelIdx];
+      this.tactical.update(
+        dt,
+        m.progress,
+        this.player.pos,
+        def.objectives,
+        this.mapRuntimes[this.levelIdx].colliders,
+        (it) => this.interact.add(it),
+        (id) => this.interact.remove(id),
+        (k, pos) => this.onCompleteObjective(k, pos),
+      );
+      m.activeObjective = this.tactical.activeObj;
+      m.activeTurrets = this.tactical.turrets.length;
+
       // interaction focus
-      const camDir = this.engine.camera.getWorldDirection(new THREE.Vector3());
-      this.focus = this.interact.findFocus(this.engine.camera.position, camDir, PLAYER.interactRange, m.time);
+      this.engine.camera.getWorldDirection(_camDir);
+      this.focus = this.interact.findFocus(this.engine.camera.position, _camDir, PLAYER.interactRange, m.time);
+
       let hold = 0;
       if (this.focus) {
         if (this.focus.kind === 'console') {
@@ -873,8 +1201,15 @@ class Game {
       } else {
         this.holdConsole = 0;
       }
+
       this.hud.setInteract(
-        this.focus ? (this.focus.kind === 'console' && !m.overheated ? 'Transmitter nominal' : this.focus.kind === 'console' ? 'Hold F to repair & reboot' : this.focus.label) : null,
+        this.focus
+          ? this.focus.kind === 'console' && !m.overheated
+            ? 'Transmitter nominal'
+            : this.focus.kind === 'console'
+              ? 'Hold F to repair & reboot'
+              : this.focus.label
+          : null,
         hold,
       );
 
@@ -908,10 +1243,21 @@ class Game {
 
     // HUD refresh
     this.hud.setTop(m);
+    this.hud.setObjective(m.activeObjective);
+    this.hud.setBuffs(m, this.player, m.activeTurrets);
     const rt = this.runtimes[this.weapons.current];
-    this.hud.setWeapon(this.weapons.current, rt.mag, rt.reserve, this.weapons.reloadTimer > 0, this.mission.level);
+    this.hud.setWeapon(
+      this.weapons.current,
+      rt.mag,
+      rt.reserve,
+      this.weapons.reloadTimer > 0,
+      this.mission.level,
+      this.weapons.locked,
+    );
     this.hud.setVitals(Math.max(0, this.player.health), this.player.armor, this.player.credits, this.player.maxHealth);
-    const spreadDeg = WEAPONS[this.weapons.current].spreadDeg * (1 - this.player.ads) + WEAPONS[this.weapons.current].adsSpreadDeg * this.player.ads;
+    const spreadDeg =
+      WEAPONS[this.weapons.current].spreadDeg * (1 - this.player.ads) +
+      WEAPONS[this.weapons.current].adsSpreadDeg * this.player.ads;
     const moveK = this.controller.planarSpeed() > 1.5 ? 1.6 : 0;
     const bloom = this.weapons.cooldown > 0 ? 2 : 0;
     this.hud.setCrosshairSpread(spreadDeg * 9 * (1 + moveK) + bloom);
@@ -927,7 +1273,9 @@ class Game {
       runtimes: this.runtimes,
       drones: this.drones,
       weapons: this.weapons,
-      spawn: (kind: DroneKind, r = 30, a = 0) => this.drones.spawn(kind, new THREE.Vector3(Math.cos(a) * r, kind === 'crawler' ? 0.6 : 4, Math.sin(a) * r)),
+      tactical: this.tactical,
+      spawn: (kind: DroneKind, r = 30, a = 0) =>
+        this.drones.spawn(kind, new THREE.Vector3(Math.cos(a) * r, kind === 'crawler' ? 0.6 : 4, Math.sin(a) * r)),
       setProgress: (p: number) => {
         this.mission.progress = p;
       },
@@ -941,11 +1289,17 @@ class Game {
       advance: () => this.advance(),
       currentLevel: () => {
         const def = LEVELS[this.levelIdx];
-        return { idx: this.levelIdx, id: def.id, name: def.name, hpMul: def.hpMul, dmgMul: def.dmgMul, launcherUnlock: def.launcherUnlock };
+        return {
+          idx: this.levelIdx,
+          id: def.id,
+          name: def.name,
+          hpMul: def.hpMul,
+          dmgMul: def.dmgMul,
+          launcherUnlock: def.weaponUnlock === 'launcher',
+          weaponUnlock: def.weaponUnlock,
+        };
       },
       activeMap: () => LEVELS[this.levelIdx].id,
-      /** Perf snapshot: true frame gaps (the clamped dt hides stalls), draw
-       *  stats, compiled program count and light-pool usage. prof(true) resets. */
       prof: (reset = false) => {
         const gaps = [...this.frameGaps].sort((a, b) => a - b);
         const q = (p: number) => (gaps.length ? gaps[Math.min(gaps.length - 1, Math.floor(gaps.length * p))] : 0);
@@ -954,16 +1308,24 @@ class Game {
         const out = {
           samples: gaps.length,
           fps: mean ? +(1000 / mean).toFixed(1) : 0,
-          frameMS: { p50: +q(0.5).toFixed(1), p90: +q(0.9).toFixed(1), p99: +q(0.99).toFixed(1), max: +q(0.999).toFixed(1) },
+          frameMS: {
+            p50: +q(0.5).toFixed(1),
+            p90: +q(0.9).toFixed(1),
+            p99: +q(0.99).toFixed(1),
+            max: +q(0.999).toFixed(1),
+          },
           hitchesOver50ms: this.frameGaps.filter((v) => v > 50).length,
-          drawCalls: info.render.calls, programs: info.programs?.length ?? 0,
-          geometries: info.memory.geometries, textures: info.memory.textures,
-          lights: this.lightRig.stats(), pixelRatio: this.engine.renderer.getPixelRatio(),
+          drawCalls: info.render.calls,
+          programs: info.programs?.length ?? 0,
+          geometries: info.memory.geometries,
+          textures: info.memory.textures,
+          lights: this.lightRig.stats(),
+          pixelRatio: this.engine.renderer.getPixelRatio(),
         };
         if (reset) this.frameGaps.length = 0;
         return out;
       },
-      rig: () => this.lightRig,   // measurement only: fixture library + pool
+      rig: () => this.lightRig,
       lightRelease: () => this.lightRig.release(),
       lightBudget: (n?: number) => {
         if (typeof n === 'number') this.lightRig.setBudget(n);
@@ -977,16 +1339,14 @@ class Game {
       },
       fire: () => this.fire(),
       step: (dt: number, render = false) => {
-        this.paused = false; // headless harness has no pointer lock; drive the sim regardless
+        this.paused = false;
         this.update(Math.min(0.05, dt), render);
       },
       rayTest: () => {
-        const ray = new THREE.Raycaster();
         const dir = this.engine.camera.getWorldDirection(new THREE.Vector3());
-        ray.set(this.engine.camera.position, dir);
-        ray.far = 200;
-        const targets = [...this.drones.hitMeshes(), ...this.staticProxies, this.groundMesh];
-        const hits = ray.intersectObjects(targets, false);
+        this.sharedRaycaster.set(this.engine.camera.position, dir);
+        this.sharedRaycaster.far = 200;
+        const hits = this.sharedRaycaster.intersectObjects(this.buildRayTargets(), false);
         return {
           dir: { x: +dir.x.toFixed(3), y: +dir.y.toFixed(3), z: +dir.z.toFixed(3) },
           hits: hits.slice(0, 4).map((h) => ({
@@ -1009,9 +1369,9 @@ class Game {
         if (held) this.fPressedEdge = true;
       },
       focusId: () => this.focus?.id ?? null,
-      airdropPos: () => this.waves.airdrops.filter((a) => a.landed && !a.opened).map((a) => ({ x: a.pos.x, z: a.pos.z })),
+      airdropPos: () =>
+        this.waves.airdrops.filter((a) => a.landed && !a.opened).map((a) => ({ x: a.pos.x, z: a.pos.z, kind: a.kind })),
       airdropClearance: () => {
-        // min signed distance from each unopened pod to the nearest collider surface (negative = buried)
         const cs = this.mapRuntimes[this.levelIdx].colliders;
         return this.waves.airdrops
           .filter((a) => !a.opened)

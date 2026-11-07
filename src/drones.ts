@@ -1,4 +1,4 @@
-// Enemy drones: five procedural multi-part types, AI behaviors, projectiles.
+// Enemy drones: 10 procedural multi-part classes, AI behaviors, projectiles, zero per-frame GC allocations.
 import * as THREE from 'three';
 import { DRONES } from './config';
 import type { Collider, DroneKind } from './state';
@@ -7,6 +7,7 @@ export interface Drone {
   kind: DroneKind;
   group: THREE.Group;
   hp: number;
+  maxHp: number;
   shield: number;
   maxShield: number;
   radius: number;
@@ -20,31 +21,31 @@ export interface Drone {
   deathTimer: number;
   targetTower: boolean;
   beepTimer: number;
-  charge: number; // warden: >0 while aiming a sniper shot
+  charge: number;
   chargeTick: number;
-  hitN: THREE.Vector3 | null; // accumulated wall-push normal from the previous frame
+  stunTimer: number;
+  isHvt?: boolean;
+  hitN: THREE.Vector3 | null;
   rotors: THREE.Object3D[];
   bodyHit: THREE.Mesh;
   shieldHit: THREE.Mesh | null;
   weakHit: THREE.Mesh | null;
   shieldMat: THREE.MeshBasicMaterial | null;
+  cloakMat?: THREE.MeshStandardMaterial;
   vel: THREE.Vector3;
 }
 
 export interface DroneCallbacks {
   onPlayerHit(dmg: number, from: THREE.Vector3): void;
   onExplosion(pos: THREE.Vector3, kind: DroneKind, killedByPlayer: boolean): void;
-  onLaser(from: THREE.Vector3, to: THREE.Vector3): void;
+  onLaser(from: THREE.Vector3, to: THREE.Vector3, color?: string): void;
   onBeep(pitch: number): void;
 }
 
-const armor = (c: number) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.5, metalness: 0.65 });
+const armor = (c: number, r = 0.45, m = 0.7) => new THREE.MeshStandardMaterial({ color: c, roughness: r, metalness: m });
 const hitMat = new THREE.MeshBasicMaterial({ visible: false });
 
-// Memoized geometry factories: every drone of a kind reuses the same buffer
-// geometry (materials stay per-drone so hit-flash/shield state is independent).
-// Warm-hostiles builds one of each kind at boot, which uploads these buffers
-// once; later spawns allocate no GPU data at all.
+// Memoized geometry cache so spawning drones never allocates GPU buffers
 const geoCache = new Map<string, THREE.BufferGeometry>();
 function geo(key: string, make: () => THREE.BufferGeometry): THREE.BufferGeometry {
   let g = geoCache.get(key);
@@ -57,19 +58,42 @@ function geo(key: string, make: () => THREE.BufferGeometry): THREE.BufferGeometr
 const gBox = (w: number, h: number, d: number): THREE.BufferGeometry => geo(`box:${w},${h},${d}`, () => new THREE.BoxGeometry(w, h, d));
 const gCyl = (rt: number, rb: number, h: number, s: number): THREE.BufferGeometry => geo(`cyl:${rt},${rb},${h},${s}`, () => new THREE.CylinderGeometry(rt, rb, h, s));
 const gSph = (r: number, ws: number, hs: number): THREE.BufferGeometry => geo(`sph:${r},${ws},${hs}`, () => new THREE.SphereGeometry(r, ws, hs));
-const gSphArc = (r: number, ws: number, hs: number, ps: number, pl: number): THREE.BufferGeometry => geo(`sphA:${r},${ws},${hs},${ps},${pl}`, () => new THREE.SphereGeometry(r, ws, hs, 0, Math.PI * 2, ps, pl));
+const gSphArc = (r: number, ws: number, hs: number, ps: number, pl: number): THREE.BufferGeometry =>
+  geo(`sphA:${r},${ws},${hs},${ps},${pl}`, () => new THREE.SphereGeometry(r, ws, hs, 0, Math.PI * 2, ps, pl));
 const gTorus = (r: number, t: number, rs: number, ts: number): THREE.BufferGeometry => geo(`tor:${r},${t},${rs},${ts}`, () => new THREE.TorusGeometry(r, t, rs, ts));
 const gCap = (r: number, l: number, cs: number, rs: number): THREE.BufferGeometry => geo(`cap:${r},${l},${cs},${rs}`, () => new THREE.CapsuleGeometry(r, l, cs, rs));
+const gOct = (r: number): THREE.BufferGeometry => geo(`oct:${r}`, () => new THREE.OctahedronGeometry(r, 0));
 
-function rotor(parent: THREE.Group, x: number, y: number, z: number, r: number, blades: THREE.Material): THREE.Object3D {
+// Shared static materials for drone parts (except per-instance shieldMat / cloakMat)
+const matCache = new Map<string, THREE.MeshStandardMaterial>();
+function sharedArmor(c: number, r = 0.45, m = 0.7): THREE.MeshStandardMaterial {
+  const k = `a:${c}:${r}:${m}`;
+  let mat = matCache.get(k);
+  if (!mat) {
+    mat = armor(c, r, m);
+    matCache.set(k, mat);
+  }
+  return mat;
+}
+function sharedEmissive(c: number, emHex: string, int: number): THREE.MeshStandardMaterial {
+  const k = `e:${c}:${emHex}:${int}`;
+  let mat = matCache.get(k);
+  if (!mat) {
+    mat = new THREE.MeshStandardMaterial({ color: c, emissive: new THREE.Color(emHex), emissiveIntensity: int, roughness: 0.3, metalness: 0.5 });
+    matCache.set(k, mat);
+  }
+  return mat;
+}
+
+function rotor(parent: THREE.Group, x: number, y: number, z: number, r: number, bladesMat: THREE.Material): THREE.Object3D {
   const arm = new THREE.Group();
   arm.position.set(x, y, z);
-  const duct = new THREE.Mesh(gTorus(r, 0.045, 6, 14), armor(0x2c3340));
+  const duct = new THREE.Mesh(gTorus(r, 0.045, 6, 14), sharedArmor(0x28313e, 0.5, 0.75));
   duct.rotation.x = Math.PI / 2;
   arm.add(duct);
   const bladesG = new THREE.Group();
   for (let i = 0; i < 2; i++) {
-    const b = new THREE.Mesh(gBox(r * 1.9, 0.015, 0.08), blades);
+    const b = new THREE.Mesh(gBox(r * 1.9, 0.015, 0.08), bladesMat);
     b.rotation.y = (i * Math.PI) / 2;
     bladesG.add(b);
   }
@@ -82,47 +106,55 @@ function rotor(parent: THREE.Group, x: number, y: number, z: number, r: number, 
 
 function buildScout(): THREE.Group {
   const g = new THREE.Group();
-  const bodyMat = armor(0x465064);
-  const hull = new THREE.Mesh(gCap(0.24, 0.42, 4, 10), bodyMat);
+  const bodyMat = sharedArmor(0x465268, 0.4, 0.75);
+  const trimMat = sharedArmor(0x252d3a, 0.65, 0.4);
+  const hull = new THREE.Mesh(gCap(0.24, 0.44, 4, 10), bodyMat);
   hull.rotation.x = Math.PI / 2;
   g.add(hull);
-  const eyeMat = new THREE.MeshStandardMaterial({ color: 0x331100, emissive: new THREE.Color('#ff5a1f'), emissiveIntensity: 2.4 });
-  const eye = new THREE.Mesh(gSph(0.09, 10, 10), eyeMat);
-  eye.position.set(0, 0, -0.42);
+  const canopy = new THREE.Mesh(gBox(0.32, 0.14, 0.42), trimMat);
+  canopy.position.set(0, 0.14, -0.05);
+  g.add(canopy);
+  const eye = new THREE.Mesh(gSph(0.095, 10, 10), sharedEmissive(0x331100, '#ff5a1f', 2.5));
+  eye.position.set(0, 0, -0.44);
   g.add(eye);
+  const gun = new THREE.Mesh(gCyl(0.025, 0.025, 0.35, 6), trimMat);
+  gun.rotation.x = Math.PI / 2;
+  gun.position.set(0, -0.14, -0.32);
+  g.add(gun);
   for (let i = 0; i < 3; i++) {
     const a = (i / 3) * Math.PI * 2 + 0.5;
-    const ax = Math.cos(a) * 0.42;
-    const az = Math.sin(a) * 0.42;
-    const arm = new THREE.Mesh(gBox(0.35, 0.04, 0.06), bodyMat);
+    const ax = Math.cos(a) * 0.44;
+    const az = Math.sin(a) * 0.44;
+    const arm = new THREE.Mesh(gBox(0.36, 0.04, 0.06), bodyMat);
     arm.position.set(ax * 0.6, 0.12, az * 0.6);
     arm.lookAt(0, 0.12, 0);
     g.add(arm);
-    rotor(g, ax, 0.18, az, 0.2, armor(0x6b7686));
+    rotor(g, ax, 0.18, az, 0.2, sharedArmor(0x6b7686));
   }
-  g.userData.blades = g.userData.blades as THREE.Object3D[];
   return g;
 }
 
 function buildHeavy(): THREE.Group {
   const g = new THREE.Group();
-  const hull = new THREE.Mesh(gBox(1.3, 0.75, 1.0), armor(0x3a4454));
+  const hull = new THREE.Mesh(gBox(1.32, 0.76, 1.04), sharedArmor(0x3a4454, 0.4, 0.75));
   hull.castShadow = true;
   g.add(hull);
-  const shoulder = new THREE.Mesh(gBox(1.7, 0.22, 0.5), armor(0x2e3746));
-  shoulder.position.set(0, 0.42, 0);
+  const shoulder = new THREE.Mesh(gBox(1.75, 0.24, 0.54), sharedArmor(0x293240, 0.65, 0.5));
+  shoulder.position.set(0, 0.44, 0);
   g.add(shoulder);
-  rotor(g, -0.75, 0.55, 0, 0.42, armor(0x59647a));
-  rotor(g, 0.75, 0.55, 0, 0.42, armor(0x59647a));
-  const coreMat = new THREE.MeshStandardMaterial({ color: 0x032a33, emissive: new THREE.Color('#22d3ee'), emissiveIntensity: 2 });
-  const core = new THREE.Mesh(gCyl(0.18, 0.18, 0.3, 10), coreMat);
-  core.position.set(0, 0, 0.55);
+  rotor(g, -0.78, 0.56, 0, 0.42, sharedArmor(0x59647a));
+  rotor(g, 0.78, 0.56, 0, 0.42, sharedArmor(0x59647a));
+  const core = new THREE.Mesh(gCyl(0.2, 0.2, 0.34, 10), sharedEmissive(0x032a33, '#22d3ee', 2.2));
+  core.position.set(0, 0.58, 0.1);
   g.add(core);
-  const eyeMat = new THREE.MeshStandardMaterial({ color: 0x330d0d, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 2.2 });
-  for (const sx of [-0.3, 0.3]) {
-    const eye = new THREE.Mesh(gSph(0.07, 8, 8), eyeMat);
-    eye.position.set(sx, 0.05, -0.52);
+  for (const sx of [-0.32, 0.32]) {
+    const eye = new THREE.Mesh(gSph(0.075, 8, 8), sharedEmissive(0x330d0d, '#ef4444', 2.4));
+    eye.position.set(sx, 0.06, -0.54);
     g.add(eye);
+    const cannon = new THREE.Mesh(gCyl(0.04, 0.04, 0.48, 8), sharedArmor(0x1e242e));
+    cannon.rotation.x = Math.PI / 2;
+    cannon.position.set(sx, -0.22, -0.62);
+    g.add(cannon);
   }
   const shieldMat = new THREE.MeshBasicMaterial({
     color: new THREE.Color('#06b6d4'),
@@ -141,107 +173,91 @@ function buildHeavy(): THREE.Group {
 
 function buildKamikaze(): THREE.Group {
   const g = new THREE.Group();
-  const coreMat = new THREE.MeshStandardMaterial({ color: 0x3a0d0d, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 2.4 });
-  const core = new THREE.Mesh(gSph(0.34, 12, 12), coreMat);
+  const core = new THREE.Mesh(gOct(0.38), sharedEmissive(0x3a0d0d, '#ef4444', 2.6));
   g.add(core);
-  const frame = new THREE.Mesh(gBox(1.0, 0.08, 1.0), armor(0x4a4034));
+  const frame = new THREE.Mesh(gBox(1.04, 0.08, 1.04), sharedArmor(0x4a4034, 0.5, 0.6));
   frame.rotation.y = Math.PI / 4;
   frame.position.y = 0.18;
   g.add(frame);
-  for (const [ax, az] of [[0.42, 0.42], [-0.42, 0.42], [0.42, -0.42], [-0.42, -0.42]] as const) {
-    rotor(g, ax, 0.26, az, 0.22, armor(0x6b7686));
+  for (const [ax, az] of [[0.44, 0.44], [-0.44, 0.44], [0.44, -0.44], [-0.44, -0.44]] as const) {
+    rotor(g, ax, 0.26, az, 0.22, sharedArmor(0x6b7686));
   }
-  const fin = new THREE.Mesh(gBox(0.05, 0.3, 0.2), armor(0x333c49));
+  const fin = new THREE.Mesh(gBox(0.05, 0.32, 0.22), sharedArmor(0x333c49));
   fin.position.set(0, 0.35, 0.3);
   g.add(fin);
-  const eyeMat = new THREE.MeshStandardMaterial({ color: 0x330d0d, emissive: new THREE.Color('#ff7847'), emissiveIntensity: 2.6 });
-  const eye = new THREE.Mesh(gSph(0.08, 8, 8), eyeMat);
-  eye.position.set(0, -0.2, -0.3);
+  const eye = new THREE.Mesh(gSph(0.085, 8, 8), sharedEmissive(0x330d0d, '#ff7847', 2.8));
+  eye.position.set(0, -0.18, -0.32);
   g.add(eye);
-  g.userData.blades = g.userData.blades as THREE.Object3D[];
   return g;
 }
 
 function buildWarden(): THREE.Group {
   const g = new THREE.Group();
-  const hull = new THREE.Mesh(gCyl(0.3, 0.42, 0.95, 6), armor(0x4e473a));
+  const hull = new THREE.Mesh(gCyl(0.3, 0.42, 0.95, 6), sharedArmor(0x4e473a, 0.45, 0.7));
   hull.castShadow = true;
   g.add(hull);
-  const collar = new THREE.Mesh(gCyl(0.46, 0.46, 0.12, 6), armor(0x33302a));
+  const collar = new THREE.Mesh(gCyl(0.46, 0.46, 0.12, 6), sharedArmor(0x33302a, 0.7, 0.4));
   collar.position.y = 0.4;
   g.add(collar);
-  rotor(g, -0.62, 0.62, 0, 0.3, armor(0x77705f));
-  rotor(g, 0.62, 0.62, 0, 0.3, armor(0x77705f));
-  const barrel = new THREE.Mesh(gCyl(0.05, 0.06, 0.95, 6), armor(0x2a2d35));
+  rotor(g, -0.62, 0.62, 0, 0.3, sharedArmor(0x77705f));
+  rotor(g, 0.62, 0.62, 0, 0.3, sharedArmor(0x77705f));
+  const barrel = new THREE.Mesh(gCyl(0.05, 0.06, 1.05, 6), sharedArmor(0x2a2d35, 0.3, 0.85));
   barrel.rotation.x = Math.PI / 2;
-  barrel.position.set(0, -0.05, -0.72);
+  barrel.position.set(0, -0.05, -0.76);
   g.add(barrel);
-  const eyeMat = new THREE.MeshStandardMaterial({ color: 0x332200, emissive: new THREE.Color('#ffb020'), emissiveIntensity: 2.6 });
-  const eye = new THREE.Mesh(gSph(0.1, 10, 10), eyeMat);
-  eye.position.set(0, 0.05, -0.4);
+  const eye = new THREE.Mesh(gSph(0.11, 10, 10), sharedEmissive(0x332200, '#ffb020', 2.8));
+  eye.position.set(0, 0.05, -0.42);
   g.add(eye);
-  const scope = new THREE.Mesh(gBox(0.16, 0.1, 0.24), armor(0x1f2430));
+  const scope = new THREE.Mesh(gBox(0.16, 0.1, 0.26), sharedArmor(0x1f2430));
   scope.position.set(0, 0.28, -0.3);
   g.add(scope);
-  const fin = new THREE.Mesh(gBox(0.05, 0.34, 0.26), armor(0x333c49));
-  fin.position.set(0, 0.28, 0.36);
-  g.add(fin);
-  g.userData.blades = g.userData.blades as THREE.Object3D[];
   return g;
 }
 
 function buildBomber(): THREE.Group {
   const g = new THREE.Group();
-  const hull = new THREE.Mesh(gBox(1.15, 0.42, 1.15), armor(0x504636));
+  const hull = new THREE.Mesh(gBox(1.18, 0.44, 1.18), sharedArmor(0x504636, 0.45, 0.65));
   hull.castShadow = true;
   g.add(hull);
-  const deck = new THREE.Mesh(gBox(1.5, 0.12, 1.5), armor(0x38322a));
+  const deck = new THREE.Mesh(gBox(1.52, 0.12, 1.52), sharedArmor(0x38322a, 0.7, 0.4));
   deck.position.y = 0.26;
   g.add(deck);
   for (let i = 0; i < 6; i++) {
     const a = (i / 6) * Math.PI * 2 + Math.PI / 6;
-    rotor(g, Math.cos(a) * 0.88, 0.36, Math.sin(a) * 0.88, 0.26, armor(0x6f6858));
+    rotor(g, Math.cos(a) * 0.88, 0.36, Math.sin(a) * 0.88, 0.26, sharedArmor(0x6f6858));
   }
-  const podMat = new THREE.MeshStandardMaterial({ color: 0x241f1a, roughness: 0.6, metalness: 0.4, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 1.1 });
-  const pod = new THREE.Mesh(gSph(0.3, 12, 10), podMat);
+  const pod = new THREE.Mesh(gSph(0.32, 12, 10), sharedEmissive(0x241f1a, '#ef4444', 1.4));
   pod.position.y = -0.42;
   g.add(pod);
-  const stripMat = new THREE.MeshStandardMaterial({ color: 0x111, emissive: new THREE.Color('#f59e0b'), emissiveIntensity: 1.6 });
-  const strip = new THREE.Mesh(gBox(1.2, 0.06, 0.06), stripMat);
+  const strip = new THREE.Mesh(gBox(1.2, 0.06, 0.06), sharedEmissive(0x111111, '#f59e0b', 1.8));
   strip.position.set(0, 0.34, 0.62);
   g.add(strip);
-  const eyeMat = new THREE.MeshStandardMaterial({ color: 0x330d0d, emissive: new THREE.Color('#ff7847'), emissiveIntensity: 2.2 });
   for (const sx of [-0.4, 0.4]) {
-    const eye = new THREE.Mesh(gSph(0.06, 8, 8), eyeMat);
+    const eye = new THREE.Mesh(gSph(0.065, 8, 8), sharedEmissive(0x330d0d, '#ff7847', 2.2));
     eye.position.set(sx, 0.1, -0.6);
     g.add(eye);
   }
-  g.userData.blades = g.userData.blades as THREE.Object3D[];
   return g;
 }
 
 function buildCrawler(): THREE.Group {
-  // Six-legged ground sweeper: low armored chassis, forward sensor mast,
-  // rear pusher duct. Legs are animated via userData.legs.
   const g = new THREE.Group();
-  const hull = new THREE.Mesh(gCyl(0.5, 0.36, 1.1, 6), armor(0x4a4436));
+  const hull = new THREE.Mesh(gCyl(0.5, 0.36, 1.1, 6), sharedArmor(0x4a4436, 0.5, 0.65));
   hull.rotation.x = Math.PI / 2;
   hull.position.y = 0.62;
   hull.castShadow = true;
   g.add(hull);
-  const plate = new THREE.Mesh(gBox(0.9, 0.14, 0.7), armor(0x35302a));
+  const plate = new THREE.Mesh(gBox(0.9, 0.14, 0.7), sharedArmor(0x35302a, 0.75, 0.4));
   plate.position.y = 1.0;
   g.add(plate);
-  const eyeMat = new THREE.MeshStandardMaterial({ color: 0x330d0d, emissive: new THREE.Color('#ff5a1f'), emissiveIntensity: 2.4 });
-  const eye = new THREE.Mesh(gSph(0.09, 8, 8), eyeMat);
+  const eye = new THREE.Mesh(gSph(0.095, 8, 8), sharedEmissive(0x330d0d, '#ff5a1f', 2.5));
   eye.position.set(0, 0.75, -0.58);
   g.add(eye);
-  const jawMat = new THREE.MeshStandardMaterial({ color: 0x1c1a16, roughness: 0.6, metalness: 0.5, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 0.8 });
-  const jaw = new THREE.Mesh(gBox(0.34, 0.2, 0.3), jawMat);
+  const jaw = new THREE.Mesh(gBox(0.36, 0.2, 0.32), sharedEmissive(0x1c1a16, '#ef4444', 1.2));
   jaw.position.set(0, 0.45, -0.68);
   g.add(jaw);
   const legGeo = gBox(0.09, 0.62, 0.09);
-  const legMat = armor(0x2c3038);
+  const legMat = sharedArmor(0x2c3038);
   const legs: THREE.Object3D[] = [];
   for (const [side, phase] of [[-1, 0], [1, Math.PI]] as const) {
     for (let i = 0; i < 3; i++) {
@@ -257,37 +273,34 @@ function buildCrawler(): THREE.Group {
     }
   }
   g.userData.legs = legs;
-  rotor(g, 0, 1.08, 0.42, 0.26, armor(0x6f6858));
+  rotor(g, 0, 1.08, 0.42, 0.26, sharedArmor(0x6f6858));
   return g;
 }
 
 function buildColossus(): THREE.Group {
-  // Armored flying fortress: slab hull, four big rotors, front shield dome, gun pod.
   const g = new THREE.Group();
-  const hull = new THREE.Mesh(gBox(2.5, 1.3, 1.9), armor(0x39414f));
+  const hull = new THREE.Mesh(gBox(2.5, 1.3, 1.9), sharedArmor(0x39414f, 0.4, 0.75));
   hull.castShadow = true;
   g.add(hull);
-  const bridge = new THREE.Mesh(gBox(1.5, 0.5, 1.2), armor(0x2b3340));
+  const bridge = new THREE.Mesh(gBox(1.5, 0.5, 1.2), sharedArmor(0x2b3340, 0.65, 0.5));
   bridge.position.y = 0.85;
   g.add(bridge);
   for (const [sx, sz] of [[-1.35, -0.9], [1.35, -0.9], [-1.35, 0.9], [1.35, 0.9]] as const) {
-    rotor(g, sx, 1.15, sz, 0.68, armor(0x57627a));
+    rotor(g, sx, 1.15, sz, 0.68, sharedArmor(0x57627a));
   }
-  const coreMat = new THREE.MeshStandardMaterial({ color: 0x032a33, emissive: new THREE.Color('#22d3ee'), emissiveIntensity: 1.8 });
-  const core = new THREE.Mesh(gCyl(0.3, 0.3, 0.5, 12), coreMat);
-  core.position.set(0, 0, 0.98);
+  const core = new THREE.Mesh(gCyl(0.32, 0.32, 0.52, 12), sharedEmissive(0x032a33, '#22d3ee', 2.2));
+  core.position.set(0, 1.15, 0);
   g.add(core);
-  const eyeMat = new THREE.MeshStandardMaterial({ color: 0x330d0d, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 2.2 });
   for (const sx of [-0.55, 0, 0.55]) {
-    const eye = new THREE.Mesh(gSph(0.09, 8, 8), eyeMat);
+    const eye = new THREE.Mesh(gSph(0.095, 8, 8), sharedEmissive(0x330d0d, '#ef4444', 2.4));
     eye.position.set(sx, 0.15, -0.98);
     g.add(eye);
   }
-  const pod = new THREE.Mesh(gBox(0.8, 0.4, 1.2), armor(0x232a35));
+  const pod = new THREE.Mesh(gBox(0.8, 0.4, 1.2), sharedArmor(0x232a35));
   pod.position.set(0, -0.8, -0.5);
   g.add(pod);
   for (const sx of [-0.25, 0.25]) {
-    const barrel = new THREE.Mesh(gCyl(0.06, 0.07, 0.9, 6), armor(0x1a1f28));
+    const barrel = new THREE.Mesh(gCyl(0.06, 0.07, 0.9, 6), sharedArmor(0x1a1f28));
     barrel.rotation.x = Math.PI / 2;
     barrel.position.set(sx, -0.85, -1.2);
     g.add(barrel);
@@ -307,18 +320,139 @@ function buildColossus(): THREE.Group {
   return g;
 }
 
-function bodyTop(p: THREE.Vector3): THREE.Vector3 {
-  return new THREE.Vector3(p.x, p.y + 1.8, p.z);
+/** NEW: Phantom Stealth Wing — swept delta-wing assassin with optical camouflage shimmer. */
+function buildPhantom(): THREE.Group {
+  const g = new THREE.Group();
+  const cloakMat = new THREE.MeshStandardMaterial({
+    color: 0x2a1f3d,
+    roughness: 0.25,
+    metalness: 0.85,
+    emissive: new THREE.Color('#7e22ce'),
+    emissiveIntensity: 0.6,
+    transparent: true,
+    opacity: 0.75,
+  });
+  g.userData.cloakMat = cloakMat;
+  // Swept fuselage + delta wings
+  const fuselage = new THREE.Mesh(gBox(0.45, 0.22, 1.15), cloakMat);
+  g.add(fuselage);
+  const leftWing = new THREE.Mesh(gBox(0.85, 0.06, 0.55), cloakMat);
+  leftWing.position.set(-0.5, 0, 0.1);
+  leftWing.rotation.y = 0.38;
+  g.add(leftWing);
+  const rightWing = new THREE.Mesh(gBox(0.85, 0.06, 0.55), cloakMat);
+  rightWing.position.set(0.5, 0, 0.1);
+  rightWing.rotation.y = -0.38;
+  g.add(rightWing);
+  // Twin violet phase emitters
+  for (const sx of [-0.24, 0.24]) {
+    const emitter = new THREE.Mesh(gSph(0.08, 8, 8), sharedEmissive(0x2e1065, '#d8b4fe', 3.0));
+    emitter.position.set(sx, 0.02, -0.58);
+    g.add(emitter);
+  }
+  rotor(g, -0.55, 0.1, 0.15, 0.2, sharedArmor(0x4c1d95));
+  rotor(g, 0.55, 0.1, 0.15, 0.2, sharedArmor(0x4c1d95));
+  return g;
 }
 
-/** Minimum distance between segments p→q and r→s (clamped endpoints). */
+/** NEW: Matrix Shield Relay — hexagonal support drone with rotating gyro-rings that projects shields to allies. */
+function buildShielder(): THREE.Group {
+  const g = new THREE.Group();
+  const core = new THREE.Mesh(gOct(0.44), sharedEmissive(0x083344, '#38bdf8', 2.5));
+  g.add(core);
+  // Rotating outer matrix ring
+  const ring = new THREE.Mesh(gTorus(0.68, 0.055, 8, 18), sharedArmor(0x38bdf8, 0.25, 0.85));
+  g.add(ring);
+  // Dorsal emitterspire
+  const pylon = new THREE.Mesh(gCyl(0.06, 0.16, 0.75, 8), sharedArmor(0x1e293b));
+  pylon.position.y = 0.55;
+  g.add(pylon);
+  const beacon = new THREE.Mesh(gSph(0.14, 10, 10), sharedEmissive(0x083344, '#22d3ee', 3.2));
+  beacon.position.y = 0.95;
+  g.add(beacon);
+  for (let i = 0; i < 4; i++) {
+    const a = (i / 4) * Math.PI * 2 + Math.PI / 4;
+    rotor(g, Math.cos(a) * 0.65, 0.15, Math.sin(a) * 0.65, 0.22, sharedArmor(0x64748b));
+  }
+  g.userData.blades = [...(g.userData.blades || []), ring];
+  return g;
+}
+
+/** NEW: Titan Apex Dreadnought — boss-tier heavy carrier with quad nacelles, radar dish & dual plasma turrets. */
+function buildTitan(): THREE.Group {
+  const g = new THREE.Group();
+  const hull = new THREE.Mesh(gBox(3.2, 1.5, 2.4), sharedArmor(0x272d38, 0.38, 0.8));
+  hull.castShadow = true;
+  g.add(hull);
+  const upperDeck = new THREE.Mesh(gBox(2.1, 0.65, 1.6), sharedArmor(0x3b4454, 0.55, 0.6));
+  upperDeck.position.y = 1.05;
+  g.add(upperDeck);
+  // Glowing dorsal reactor core (weak spot)
+  const reactor = new THREE.Mesh(gCyl(0.45, 0.45, 0.65, 12), sharedEmissive(0x450a0a, '#f59e0b', 2.8));
+  reactor.position.set(0, 1.48, 0);
+  g.add(reactor);
+  // Rotating radar dish
+  const radar = new THREE.Mesh(gBox(1.1, 0.12, 0.22), sharedArmor(0x94a3b8, 0.3, 0.85));
+  radar.position.set(0, 1.9, -0.35);
+  g.add(radar);
+  // Quad heavy thruster nacelles
+  for (const [sx, sz] of [[-1.85, -1.1], [1.85, -1.1], [-1.85, 1.1], [1.85, 1.1]] as const) {
+    rotor(g, sx, 1.3, sz, 0.82, sharedArmor(0x64748b));
+  }
+  // Dual underslung heavy plasma cannons
+  for (const sx of [-0.65, 0.65]) {
+    const turret = new THREE.Mesh(gBox(0.55, 0.45, 0.9), sharedArmor(0x1e242d));
+    turret.position.set(sx, -0.95, -0.6);
+    g.add(turret);
+    const barrel = new THREE.Mesh(gCyl(0.08, 0.09, 1.25, 8), sharedArmor(0x0f172a));
+    barrel.rotation.x = Math.PI / 2;
+    barrel.position.set(sx, -0.98, -1.45);
+    g.add(barrel);
+    const muzzleGlow = new THREE.Mesh(gSph(0.11, 8, 8), sharedEmissive(0x450a0a, '#ef4444', 2.8));
+    muzzleGlow.position.set(sx, -0.98, -0.95);
+    g.add(muzzleGlow);
+  }
+  // Frontal shield dome
+  const shieldMat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color('#f59e0b'),
+    transparent: true,
+    opacity: 0.24,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  const shield = new THREE.Mesh(gSphArc(2.55, 18, 12, Math.PI * 0.7, Math.PI * 1.6), shieldMat);
+  shield.rotation.y = Math.PI / 2;
+  g.add(shield);
+  g.userData.shieldMesh = shield;
+  g.userData.blades = [...(g.userData.blades || []), radar];
+  return g;
+}
+
+// Pre-allocated scratch vectors for zero GC pressure in update loop
+const _tmp = new THREE.Vector3();
+const _sep = new THREE.Vector3();
+const _tangential = new THREE.Vector3();
+const _weave = new THREE.Vector3();
+const _desired = new THREE.Vector3();
+const _from = new THREE.Vector3();
+const _to = new THREE.Vector3();
+const _prev = new THREE.Vector3();
+const _bodyTop = new THREE.Vector3();
+const _d1 = new THREE.Vector3();
+const _d2 = new THREE.Vector3();
+const _rp = new THREE.Vector3();
+const _p1 = new THREE.Vector3();
+const _p2 = new THREE.Vector3();
+const _tangent = new THREE.Vector3();
+
 function segSegDist(p: THREE.Vector3, q: THREE.Vector3, r: THREE.Vector3, s: THREE.Vector3): number {
-  const d1 = q.clone().sub(p);
-  const d2 = s.clone().sub(r);
-  const rp = p.clone().sub(r);
-  const a = d1.lengthSq();
-  const e = d2.lengthSq();
-  const f = d2.dot(rp);
+  _d1.copy(q).sub(p);
+  _d2.copy(s).sub(r);
+  _rp.copy(p).sub(r);
+  const a = _d1.lengthSq();
+  const e = _d2.lengthSq();
+  const f = _d2.dot(_rp);
   let t = 0;
   let u = 0;
   let b = 0;
@@ -327,11 +461,11 @@ function segSegDist(p: THREE.Vector3, q: THREE.Vector3, r: THREE.Vector3, s: THR
   if (a <= 1e-9) {
     u = f / e;
   } else {
-    c = d1.dot(rp);
+    c = _d1.dot(_rp);
     if (e <= 1e-9) {
       t = -c / a;
     } else {
-      b = d1.dot(d2);
+      b = _d1.dot(_d2);
       const denom = a * e - b * b;
       t = denom !== 0 ? (b * f - c * e) / denom : 0;
       u = (b * t + f) / e;
@@ -341,7 +475,9 @@ function segSegDist(p: THREE.Vector3, q: THREE.Vector3, r: THREE.Vector3, s: THR
     t = THREE.MathUtils.clamp((b * u - c) / a, 0, 1);
   }
   u = THREE.MathUtils.clamp(u, 0, 1);
-  return p.clone().addScaledVector(d1, t).distanceTo(r.clone().addScaledVector(d2, u));
+  _p1.copy(p).addScaledVector(_d1, t);
+  _p2.copy(r).addScaledVector(_d2, u);
+  return _p1.distanceTo(_p2);
 }
 
 const BUILDERS: Record<DroneKind, () => THREE.Group> = {
@@ -352,6 +488,9 @@ const BUILDERS: Record<DroneKind, () => THREE.Group> = {
   bomber: buildBomber,
   crawler: buildCrawler,
   colossus: buildColossus,
+  phantom: buildPhantom,
+  shielder: buildShielder,
+  titan: buildTitan,
 };
 
 interface BoltSlot {
@@ -361,26 +500,25 @@ interface BoltSlot {
   dmg: number;
 }
 
-const PROJ_POOL = 96;
-const BOMB_POOL = 24;
+const PROJ_POOL = 110;
+const BOMB_POOL = 28;
 
 export class DroneManager {
   drones: Drone[] = [];
   private scene: THREE.Scene;
-  // Projectile/bomb pools: pre-built hidden meshes (shared geo+material) so the
-  // first shot of a fight compiles nothing and uploads nothing — the boot
-  // warm-up already painted these. Only visibility/position change at runtime.
   private projectiles: BoltSlot[] = [];
   private projFree: number[] = [];
   private bombs: BoltSlot[] = [];
   private bombFree: number[] = [];
-  private projGeo = gSph(0.09, 6, 6);
+  private projGeo = gSph(0.095, 6, 6);
   private projMat = new THREE.MeshBasicMaterial({ color: new THREE.Color('#ff6b4a'), blending: THREE.AdditiveBlending, transparent: true, fog: false });
-  private bombGeo = gSph(0.16, 8, 8);
-  private bombMat = new THREE.MeshStandardMaterial({ color: 0x14100c, roughness: 0.7, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 1.2 });
+  private bombGeo = gSph(0.17, 8, 8);
+  private bombMat = new THREE.MeshStandardMaterial({ color: 0x14100c, roughness: 0.7, emissive: new THREE.Color('#ef4444'), emissiveIntensity: 1.4 });
   private colliders: Collider[] = [];
   private hpMul = 1;
   private dmgMul = 1;
+  private _hitCache: THREE.Object3D[] = [];
+  private _hitDirty = true;
 
   constructor(scene: THREE.Scene, private cb: DroneCallbacks) {
     this.scene = scene;
@@ -400,11 +538,9 @@ export class DroneManager {
     }
   }
 
-  /** Grab a bolt slot (steal the oldest when saturated) and arm it. */
   private fireBolt(pool: BoltSlot[], free: number[], from: THREE.Vector3, vel: THREE.Vector3, life: number, dmg: number, scale = 1): void {
     let i = free.pop();
     if (i === undefined) {
-      // oldest active bolt: hide it and reuse its slot
       const old = pool.find((p) => p.life > 0);
       if (old) {
         old.mesh.visible = false;
@@ -427,46 +563,56 @@ export class DroneManager {
     free.push(i);
   }
 
-  /** Buildings/terrain the drones must fly around (same set the player collides with). */
   setColliders(list: Collider[]): void {
     this.colliders = list;
   }
 
-  /** Per-level difficulty scaling: HP/shield at spawn, damage at shot time. */
   setMods(hpMul: number, dmgMul: number): void {
     this.hpMul = hpMul;
     this.dmgMul = dmgMul;
   }
 
-  spawn(kind: DroneKind, pos: THREE.Vector3): void {
+  spawn(kind: DroneKind, pos: THREE.Vector3, isHvt = false): Drone {
     const base = DRONES[kind];
     const group = BUILDERS[kind]();
     group.position.copy(pos);
+    if (isHvt) group.scale.setScalar(1.22);
 
-    const bodyHit = new THREE.Mesh(gSph(base.radius + 0.12, 8, 8), hitMat);
+    const bodyHit = new THREE.Mesh(gSph(base.radius + 0.14, 8, 8), hitMat);
     group.add(bodyHit);
     let shieldHit: THREE.Mesh | null = null;
     let weakHit: THREE.Mesh | null = null;
-    if (kind === 'heavy' || kind === 'colossus') {
-      const big = kind === 'colossus';
-      shieldHit = new THREE.Mesh(gSph(big ? 2.15 : 1.3, 10, 8), hitMat);
-      shieldHit.position.set(0, 0, big ? -0.9 : -0.45);
+    if (kind === 'heavy' || kind === 'colossus' || kind === 'titan') {
+      const sRad = kind === 'titan' ? 2.65 : kind === 'colossus' ? 2.15 : 1.3;
+      const sOff = kind === 'titan' ? -1.1 : kind === 'colossus' ? -0.9 : -0.45;
+      const wRad = kind === 'titan' ? 0.95 : kind === 'colossus' ? 0.75 : 0.52;
+      const wOff = kind === 'titan' ? 1.45 : kind === 'colossus' ? 1.05 : 0.62;
+      shieldHit = new THREE.Mesh(gSph(sRad, 10, 8), hitMat);
+      shieldHit.position.set(0, 0, sOff);
       group.add(shieldHit);
-      weakHit = new THREE.Mesh(gSph(big ? 0.75 : 0.5, 6, 6), hitMat);
-      weakHit.position.set(0, big ? 1.05 : 0.62, 0);
+      weakHit = new THREE.Mesh(gSph(wRad, 6, 6), hitMat);
+      weakHit.position.set(0, wOff, 0);
+      group.add(weakHit);
+    } else if (kind === 'warden' || kind === 'bomber' || kind === 'shielder') {
+      weakHit = new THREE.Mesh(gSph(0.42, 6, 6), hitMat);
+      weakHit.position.set(0, kind === 'bomber' ? -0.42 : 0.45, 0);
       group.add(weakHit);
     }
 
+    const hpScaled = Math.round(base.hp * this.hpMul * (isHvt ? 1.65 : 1));
+    const shScaled = Math.round(base.shield * this.hpMul * (isHvt ? 1.5 : 1));
+    const shieldMesh = group.userData.shieldMesh as THREE.Mesh | undefined;
     const drone: Drone = {
       kind,
       group,
-      hp: Math.round(base.hp * this.hpMul),
-      shield: Math.round(base.shield * this.hpMul),
-      maxShield: Math.round(base.shield * this.hpMul),
-      radius: base.radius,
+      hp: hpScaled,
+      maxHp: hpScaled,
+      shield: shScaled,
+      maxShield: Math.max(1, shScaled),
+      radius: base.radius * (isHvt ? 1.2 : 1),
       phase: Math.random() * Math.PI * 2,
       strafe: Math.random() > 0.5 ? 1 : -1,
-      fireTimer: 1 + Math.random() * 2,
+      fireTimer: 0.9 + Math.random() * 1.8,
       burstLeft: 0,
       burstTimer: 0,
       spotted: false,
@@ -476,12 +622,15 @@ export class DroneManager {
       beepTimer: 0,
       charge: 0,
       chargeTick: 0,
+      stunTimer: 0,
+      isHvt,
       hitN: null,
       rotors: (group.userData.blades as THREE.Object3D[]) ?? [],
       bodyHit,
       shieldHit,
       weakHit,
-      shieldMat: kind === 'heavy' ? ((group.userData.shieldMesh as THREE.Mesh).material as THREE.MeshBasicMaterial) : null,
+      shieldMat: shieldMesh ? (shieldMesh.material as THREE.MeshBasicMaterial) : null,
+      cloakMat: group.userData.cloakMat as THREE.MeshStandardMaterial | undefined,
       vel: new THREE.Vector3(),
     };
     bodyHit.userData = { drone, part: 'body' };
@@ -489,81 +638,100 @@ export class DroneManager {
     if (weakHit) weakHit.userData = { drone, part: 'weak' };
     this.drones.push(drone);
     this.scene.add(group);
+    this._hitDirty = true;
+    return drone;
   }
 
   hitMeshes(): THREE.Object3D[] {
-    const out: THREE.Object3D[] = [];
-    for (const d of this.drones) {
-      if (d.dying) continue;
-      out.push(d.bodyHit);
-      if (d.shieldHit && d.shield > 0) out.push(d.shieldHit);
-      if (d.weakHit) out.push(d.weakHit);
+    if (this._hitDirty) {
+      this._hitCache.length = 0;
+      for (let i = 0; i < this.drones.length; i++) {
+        const d = this.drones[i];
+        if (d.dying) continue;
+        this._hitCache.push(d.bodyHit);
+        if (d.shieldHit && d.shield > 0) this._hitCache.push(d.shieldHit);
+        if (d.weakHit) this._hitCache.push(d.weakHit);
+      }
+      this._hitDirty = false;
     }
-    return out;
+    return this._hitCache;
   }
 
-  /** Apply weapon damage to a drone via one of its hit proxies.
-   *  'shield' = frontal energy shield, 'weak' = top rotor / back core (x2 shield break),
-   *  'body' = hull (shield does not protect from behind). */
-  applyDamage(drone: Drone, part: string, dmg: number): { killed: boolean; shieldHit: boolean } {
-    if (drone.dying) return { killed: false, shieldHit: false };
+  applyDamage(drone: Drone, part: string, dmg: number, shieldMult = 1.0): { killed: boolean; shieldHit: boolean; crit: boolean } {
+    if (drone.dying) return { killed: false, shieldHit: false, crit: false };
     let d = dmg;
     let shieldHit = false;
-    if (part === 'weak') {
-      d *= 2;
+    const crit = part === 'weak';
+    if (crit) {
+      d *= 2.0;
       if (drone.shield > 0) {
-        const absorbed = Math.min(drone.shield, d);
+        const absorbed = Math.min(drone.shield, d * shieldMult);
         drone.shield -= absorbed;
-        d -= absorbed;
+        d = Math.max(0, d - absorbed / shieldMult);
         shieldHit = true;
       }
     } else if (part === 'shield' && drone.shield > 0) {
-      const absorbed = Math.min(drone.shield, d);
+      const effShieldDmg = d * shieldMult;
+      const absorbed = Math.min(drone.shield, effShieldDmg);
       drone.shield -= absorbed;
-      d -= absorbed;
+      d = Math.max(0, d - absorbed / shieldMult);
       shieldHit = true;
     }
     if (drone.shield <= 0 && drone.shieldMat) {
       drone.shieldMat.opacity = 0;
       const sm = drone.group.userData.shieldMesh as THREE.Mesh | undefined;
-      if (sm) sm.visible = false;
+      if (sm && sm.visible) {
+        sm.visible = false;
+        this._hitDirty = true;
+      }
     }
     drone.hp -= d;
-    if (drone.shieldMat && drone.shield <= 0) {
-      drone.shieldMat.opacity = 0;
-      const sm = drone.group.userData.shieldMesh as THREE.Mesh | undefined;
-      if (sm) sm.visible = false;
-    }
     if (drone.hp <= 0) {
-      if (drone.kind === 'kamikaze') {
-        this.cb.onExplosion(drone.group.position.clone(), 'kamikaze', true);
-      }
       drone.dying = true;
-      drone.deathTimer = 1.4;
-      if (drone.kind !== 'kamikaze') this.cb.onExplosion(drone.group.position.clone(), drone.kind, true);
-      return { killed: true, shieldHit };
+      drone.deathTimer = drone.kind === 'kamikaze' ? 0.02 : 0.95;
+      this._hitDirty = true;
+      this.cb.onExplosion(drone.group.position.clone(), drone.kind, true);
+      return { killed: true, shieldHit, crit };
     }
-    return { killed: false, shieldHit };
+    return { killed: false, shieldHit, crit };
+  }
+
+  /** Stun and damage all active drones within radius (Cryo-EMP pod). */
+  empShockwave(center: THREE.Vector3, radius: number, dmg: number): number {
+    let hitCount = 0;
+    for (const d of [...this.drones]) {
+      if (d.dying) continue;
+      if (d.group.position.distanceTo(center) <= radius) {
+        d.stunTimer = 4.5;
+        d.shield = 0;
+        this.applyDamage(d, 'body', dmg, 2.0);
+        hitCount++;
+      }
+    }
+    return hitCount;
   }
 
   killAll(): void {
     for (const d of this.drones) {
       if (!d.dying) {
         d.dying = true;
-        d.deathTimer = 0.9;
+        d.deathTimer = 0.85;
         this.cb.onExplosion(d.group.position.clone(), d.kind, true);
       }
     }
+    this._hitDirty = true;
   }
 
   activeCount(): number {
-    return this.drones.filter((d) => !d.dying).length;
+    let n = 0;
+    for (let i = 0; i < this.drones.length; i++) if (!this.drones[i].dying) n++;
+    return n;
   }
 
-  /** Remove every hostile, projectile and bomb (campaign level switch). */
   clearHostiles(): void {
     for (const d of this.drones) this.scene.remove(d.group);
     this.drones.length = 0;
+    this._hitDirty = true;
     this.projectiles.forEach((p, i) => {
       if (p.life > 0) DroneManager.release(this.projectiles, this.projFree, i);
     });
@@ -572,141 +740,191 @@ export class DroneManager {
     });
   }
 
-  update(
-    dt: number,
-    time: number,
-    playerPos: THREE.Vector3,
-    towerPos: THREE.Vector3,
-    alive: boolean,
-  ): void {
-    const tmp = new THREE.Vector3();
-
+  update(dt: number, time: number, playerPos: THREE.Vector3, towerPos: THREE.Vector3, alive: boolean): void {
     for (let i = this.drones.length - 1; i >= 0; i--) {
       const d = this.drones[i];
-      // rotor spin always
-      for (const b of d.rotors) b.rotation.y += dt * 40;
+      for (let r = 0; r < d.rotors.length; r++) d.rotors[r].rotation.y += dt * 38;
 
+      // Fast, zero-allocation death tumble (no material cloning!)
       if (d.dying) {
         d.deathTimer -= dt;
-        d.group.rotation.z += dt * 6;
-        d.group.rotation.x += dt * 2;
-        d.group.position.y -= dt * 9;
-        d.group.traverse((o) => {
-          const mesh = o as THREE.Mesh;
-          if (mesh.isMesh && mesh.material instanceof THREE.MeshStandardMaterial) {
-            let mat = mesh.material;
-            if (!mesh.userData.dyingInit) {
-              mesh.userData.dyingInit = true;
-              mat = mat.clone();
-              mesh.material = mat;
-            }
-            mat.emissive = new THREE.Color('#ff6a00');
-            mat.emissiveIntensity = Math.max(0, mat.emissiveIntensity * (1 - dt * 2));
-          }
-        });
+        d.group.rotation.z += dt * 7;
+        d.group.rotation.x += dt * 3;
+        d.group.position.y -= dt * 9.5;
+        const s = Math.max(0.1, d.deathTimer);
+        d.group.scale.setScalar(s);
         if (d.deathTimer <= 0) {
           this.scene.remove(d.group);
           this.drones.splice(i, 1);
+          this._hitDirty = true;
         }
         continue;
       }
 
       if (!alive) continue;
 
+      if (d.stunTimer > 0) {
+        d.stunTimer -= dt;
+        d.group.position.y = Math.max(1.2, d.group.position.y - dt * 1.5);
+        d.group.rotation.z = Math.sin(time * 22 + d.phase) * 0.25;
+        continue;
+      } else {
+        d.group.rotation.z = 0;
+      }
+
       const base = DRONES[d.kind];
       const target = d.kind === 'kamikaze' && d.targetTower ? towerPos : playerPos;
-      const toTarget = tmp.copy(target).sub(d.group.position);
-      const dist = toTarget.length();
-      toTarget.normalize();
+      _tmp.copy(target).sub(d.group.position);
+      const dist = _tmp.length();
+      if (dist > 1e-4) _tmp.divideScalar(dist);
 
-      // separation from neighbours
-      const sep = new THREE.Vector3();
-      for (const o of this.drones) {
+      // Separation from neighbours (zero allocations)
+      _sep.set(0, 0, 0);
+      for (let j = 0; j < this.drones.length; j++) {
+        const o = this.drones[j];
         if (o === d || o.dying) continue;
-        const dd = o.group.position.distanceTo(d.group.position);
-        if (dd < 2.2 && dd > 0.001) sep.addScaledVector(d.group.position.clone().sub(o.group.position), (2.2 - dd) / dd);
+        const dx = d.group.position.x - o.group.position.x;
+        const dy = d.group.position.y - o.group.position.y;
+        const dz = d.group.position.z - o.group.position.z;
+        const dd = Math.hypot(dx, dy, dz);
+        if (dd < 2.4 && dd > 0.001) {
+          const push = (2.4 - dd) / dd;
+          _sep.x += dx * push;
+          _sep.y += dy * push;
+          _sep.z += dz * push;
+        }
       }
 
       const speed = base.speed;
 
-      if (d.kind === 'scout') {
-        const ring = 11 + Math.sin(time * 0.6 + d.phase) * 3;
-        const tangential = new THREE.Vector3(-toTarget.z, 0, toTarget.x).multiplyScalar(d.strafe);
-        const weave = new THREE.Vector3(Math.sin(time * 3.1 + d.phase), Math.sin(time * 2.3 + d.phase * 2) * 0.5, Math.cos(time * 2.7 + d.phase)).multiplyScalar(d.spotted ? 0.8 : 2.6);
-        // close in until the orbit ring, then hold station (was inverted: fled outward)
-        const desired = toTarget.multiplyScalar(dist > ring ? speed : -speed * 0.6).add(tangential.multiplyScalar(speed * 0.5)).add(weave).add(sep.multiplyScalar(1.4));
-        desired.y += (3.2 + Math.sin(time + d.phase) * 1.2 - d.group.position.y) * 1.5;
-        this.steer(d, desired, dt, speed * 1.6);
+      if (d.kind === 'scout' || d.kind === 'phantom') {
+        const isPhantom = d.kind === 'phantom';
+        if (isPhantom && d.cloakMat) {
+          d.cloakMat.opacity = d.spotted || dist < 12 ? 0.92 : 0.24 + 0.16 * Math.sin(time * 4.5 + d.phase);
+        }
+        const ring = isPhantom ? 13 : 11 + Math.sin(time * 0.6 + d.phase) * 3;
+        _tangential.set(-_tmp.z, 0, _tmp.x).multiplyScalar(d.strafe * speed * (isPhantom ? 0.85 : 0.5));
+        _weave
+          .set(Math.sin(time * 3.4 + d.phase), Math.sin(time * 2.3 + d.phase * 2) * 0.5, Math.cos(time * 2.9 + d.phase))
+          .multiplyScalar(d.spotted ? 0.8 : isPhantom ? 3.8 : 2.5);
+        _desired
+          .copy(_tmp)
+          .multiplyScalar(dist > ring ? speed : -speed * 0.6)
+          .add(_tangential)
+          .add(_weave)
+          .addScaledVector(_sep, 1.4);
+        _desired.y += (3.4 + Math.sin(time + d.phase) * 1.2 - d.group.position.y) * 1.5;
+        this.steer(d, _desired, dt, speed * 1.6);
+        d.group.lookAt(playerPos.x, d.group.position.y, playerPos.z);
+      } else if (d.kind === 'shielder') {
+        // Shielder orbits at medium range and periodically restores shield to nearby allies
+        const ring = 21;
+        _tangential.set(-_tmp.z, 0, _tmp.x).multiplyScalar(d.strafe * speed * 0.7);
+        _desired
+          .copy(_tmp)
+          .multiplyScalar(dist > ring ? speed : -speed * 0.45)
+          .add(_tangential)
+          .addScaledVector(_sep, 1.8);
+        _desired.y += (5.2 + Math.sin(time * 1.2 + d.phase) * 0.8 - d.group.position.y) * 1.3;
+        this.steer(d, _desired, dt, speed * 1.3);
+        d.chargeTick -= dt;
+        if (d.chargeTick <= 0) {
+          d.chargeTick = 1.6;
+          for (let j = 0; j < this.drones.length; j++) {
+            const ally = this.drones[j];
+            if (ally === d || ally.dying || ally.kind === 'shielder') continue;
+            if (ally.group.position.distanceTo(d.group.position) < 16 && ally.shield < ally.maxShield) {
+              ally.shield = Math.min(ally.maxShield, ally.shield + 18);
+              this.cb.onLaser(d.group.position, ally.group.position, '#38bdf8');
+              break;
+            }
+          }
+        }
       } else if (d.kind === 'heavy') {
         const ring = 17;
-        const tangential = new THREE.Vector3(-toTarget.z, 0, toTarget.x).multiplyScalar(d.strafe * (d.spotted ? 0 : speed * 0.55));
-        const desired = toTarget.multiplyScalar(dist > ring ? speed : -speed * 0.4).add(tangential).add(sep.multiplyScalar(2));
-        desired.y += (4.2 - d.group.position.y) * 1.2;
-        this.steer(d, desired, dt, speed * 1.2);
+        _tangential.set(-_tmp.z, 0, _tmp.x).multiplyScalar(d.strafe * (d.spotted ? 0 : speed * 0.55));
+        _desired
+          .copy(_tmp)
+          .multiplyScalar(dist > ring ? speed : -speed * 0.4)
+          .add(_tangential)
+          .addScaledVector(_sep, 2);
+        _desired.y += (4.2 - d.group.position.y) * 1.2;
+        this.steer(d, _desired, dt, speed * 1.2);
         d.group.lookAt(playerPos.x, d.group.position.y, playerPos.z);
-      } else if (d.kind === 'colossus') {
-        // slow siege unit: wide low orbit, face the player, volley its gun pods
-        const ring = 20;
-        const tangential = new THREE.Vector3(-toTarget.z, 0, toTarget.x).multiplyScalar(d.strafe * (d.spotted ? 0 : speed * 0.5));
-        const desired = toTarget.clone().multiplyScalar(dist > ring ? speed : -speed * 0.35).add(tangential).add(sep.multiplyScalar(2.4));
-        desired.y += (5.0 - d.group.position.y) * 1.1;
-        this.steer(d, desired, dt, speed * 1.2);
+      } else if (d.kind === 'colossus' || d.kind === 'titan') {
+        const isTitan = d.kind === 'titan';
+        const ring = isTitan ? 23 : 20;
+        _tangential.set(-_tmp.z, 0, _tmp.x).multiplyScalar(d.strafe * (d.spotted ? 0 : speed * 0.5));
+        _desired
+          .copy(_tmp)
+          .multiplyScalar(dist > ring ? speed : -speed * 0.35)
+          .add(_tangential)
+          .addScaledVector(_sep, 2.4);
+        _desired.y += ((isTitan ? 6.2 : 5.0) - d.group.position.y) * 1.1;
+        this.steer(d, _desired, dt, speed * 1.2);
         d.group.lookAt(playerPos.x, d.group.position.y, playerPos.z);
       } else if (d.kind === 'crawler') {
-        // ground sweeper: drives at the player, blocked by every low obstacle
-        const desired = toTarget.clone().multiplyScalar(speed).add(sep.multiplyScalar(1.6));
-        desired.y += (0.75 - d.group.position.y) * 3;
-        this.steer(d, desired, dt, speed * 1.4);
+        _desired.copy(_tmp).multiplyScalar(speed).addScaledVector(_sep, 1.6);
+        _desired.y += (0.75 - d.group.position.y) * 3;
+        this.steer(d, _desired, dt, speed * 1.4);
         d.group.lookAt(target.x, d.group.position.y, target.z);
         const legs = d.group.userData.legs as THREE.Object3D[] | undefined;
-        if (legs) for (let li = 0; li < legs.length; li++) legs[li].rotation.x = Math.sin(time * 16 + (legs[li].userData.phase as number)) * 0.42;
-        if (dist < 2.4 && alive) {
+        if (legs) {
+          for (let li = 0; li < legs.length; li++) {
+            legs[li].rotation.x = Math.sin(time * 16 + (legs[li].userData.phase as number)) * 0.42;
+          }
+        }
+        if (dist < 2.5 && alive) {
           d.fireTimer -= dt;
           if (d.fireTimer <= 0) {
             d.fireTimer = base.fireInterval * (0.85 + Math.random() * 0.4);
-            const from = d.group.position.clone().add(new THREE.Vector3(0, 0.6, 0));
-            const to = playerPos.clone().add(new THREE.Vector3(0, 1.0, 0));
-            this.cb.onLaser(from, to); // short bite flash
-            this.cb.onPlayerHit(Math.round(base.fireDamage * this.dmgMul), from);
+            _from.copy(d.group.position).y += 0.6;
+            _to.copy(playerPos).y += 1.0;
+            this.cb.onLaser(_from, _to);
+            this.cb.onPlayerHit(Math.round(base.fireDamage * this.dmgMul), _from);
             this.cb.onBeep(240);
           }
         }
       } else if (d.kind === 'warden') {
-        // long-range designator: holds a wide orbit, charges, then snaps one shot
         const ring = 30;
-        const tangential = new THREE.Vector3(-toTarget.z, 0, toTarget.x).multiplyScalar(d.strafe * speed * 0.75);
+        _tangential.set(-_tmp.z, 0, _tmp.x).multiplyScalar(d.strafe * speed * 0.75);
         const radial = dist > ring + 3 ? speed : dist < ring - 4 ? -speed : 0;
-        const desired = toTarget.clone().multiplyScalar(radial).add(tangential).add(sep.multiplyScalar(1.5));
-        desired.y += (6.2 + Math.sin(time * 0.7 + d.phase) * 0.8 - d.group.position.y) * 1.2;
-        this.steer(d, desired, dt, speed * 1.3);
+        _desired.copy(_tmp).multiplyScalar(radial).add(_tangential).addScaledVector(_sep, 1.5);
+        _desired.y += (6.2 + Math.sin(time * 0.7 + d.phase) * 0.8 - d.group.position.y) * 1.2;
+        this.steer(d, _desired, dt, speed * 1.3);
         d.group.lookAt(target.x, d.group.position.y, target.z);
       } else if (d.kind === 'bomber') {
-        // hovers high over the yard and lobs gravity bombs at the player
         const ring = 20;
-        const tangential = new THREE.Vector3(-toTarget.z, 0, toTarget.x).multiplyScalar(d.strafe * speed * 0.6);
-        const desired = toTarget.clone().multiplyScalar(dist > ring ? speed : -speed * 0.4).add(tangential).add(sep.multiplyScalar(2));
-        desired.y += (7.6 - d.group.position.y) * 1.2;
-        this.steer(d, desired, dt, speed * 1.3);
+        _tangential.set(-_tmp.z, 0, _tmp.x).multiplyScalar(d.strafe * speed * 0.6);
+        _desired
+          .copy(_tmp)
+          .multiplyScalar(dist > ring ? speed : -speed * 0.4)
+          .add(_tangential)
+          .addScaledVector(_sep, 2);
+        _desired.y += (7.6 - d.group.position.y) * 1.2;
+        this.steer(d, _desired, dt, speed * 1.3);
         d.group.lookAt(target.x, d.group.position.y, target.z);
         d.fireTimer -= dt;
         if (d.fireTimer <= 0) {
           d.fireTimer = base.fireInterval * (0.8 + Math.random() * 0.5);
-          const from = d.group.position.clone().add(new THREE.Vector3(0, -0.6, 0));
-          const lead = new THREE.Vector3(playerPos.x - d.group.position.x, 0, playerPos.z - d.group.position.z).clampLength(0, 3);
-          this.fireBolt(this.bombs, this.bombFree, from, new THREE.Vector3(lead.x, -1, lead.z), 8, 0);
+          _from.copy(d.group.position).y -= 0.6;
+          _to.set(playerPos.x - d.group.position.x, 0, playerPos.z - d.group.position.z).clampLength(0, 3);
+          _to.y = -1;
+          this.fireBolt(this.bombs, this.bombFree, _from, _to, 8, 0);
           this.cb.onBeep(320);
         }
       } else {
         // kamikaze dive
-        const desired = toTarget.clone().multiplyScalar(speed).add(sep.multiplyScalar(1.8));
-        desired.y += (Math.max(target.y + 1.2, 1.6) - d.group.position.y) * 0.8;
-        this.steer(d, desired, dt, speed * 1.5);
+        _desired.copy(_tmp).multiplyScalar(speed).addScaledVector(_sep, 1.8);
+        _desired.y += (Math.max(target.y + 1.2, 1.6) - d.group.position.y) * 0.8;
+        this.steer(d, _desired, dt, speed * 1.5);
         d.group.lookAt(target.x, target.y + 1, target.z);
         const fuseRange = d.targetTower ? 3.6 : 2.4;
         if (dist < fuseRange) {
           this.cb.onExplosion(d.group.position.clone(), 'kamikaze', false);
           d.dying = true;
           d.deathTimer = 0.01;
+          this._hitDirty = true;
           continue;
         }
         d.beepTimer -= dt;
@@ -717,25 +935,29 @@ export class DroneManager {
         }
       }
 
-      // warden charge-up & sniper shot
+      // Warden sniper charge & shot
       if (d.kind === 'warden') {
         if (d.charge > 0) {
           d.charge -= dt;
           d.chargeTick -= dt;
           if (d.chargeTick <= 0) {
             d.chargeTick = 0.28;
-            const from = d.group.position.clone();
-            const to = playerPos.clone().add(new THREE.Vector3(0, 1.1, 0));
-            this.cb.onLaser(from, to); // red aim-line telegraph
+            _from.copy(d.group.position);
+            _to.copy(playerPos).y += 1.1;
+            this.cb.onLaser(_from, _to, '#ff3b30');
             this.cb.onBeep(1150);
           }
           if (d.charge <= 0) {
-            const from = d.group.position.clone();
-            const to = playerPos.clone().add(new THREE.Vector3(0, 1.0, 0));
-            const jitter = new THREE.Vector3((Math.random() - 0.5) * 0.5, (Math.random() - 0.5) * 0.3, (Math.random() - 0.5) * 0.5).multiplyScalar(d.spotted ? 0.3 : 1);
-            to.add(jitter);
-            this.cb.onLaser(from, to);
-            this.fireBolt(this.projectiles, this.projFree, from, to.sub(from).normalize().multiplyScalar(34), 4, Math.round(base.fireDamage * this.dmgMul), 1.4);
+            _from.copy(d.group.position);
+            const jScale = d.spotted ? 0.3 : 1;
+            _to.set(
+              playerPos.x + (Math.random() - 0.5) * 0.5 * jScale,
+              playerPos.y + 1.0 + (Math.random() - 0.5) * 0.3 * jScale,
+              playerPos.z + (Math.random() - 0.5) * 0.5 * jScale,
+            );
+            this.cb.onLaser(_from, _to, '#ff5a4a');
+            _to.sub(_from).normalize().multiplyScalar(34);
+            this.fireBolt(this.projectiles, this.projFree, _from, _to, 4, Math.round(base.fireDamage * this.dmgMul), 1.4);
           }
         } else {
           d.fireTimer -= dt;
@@ -747,20 +969,40 @@ export class DroneManager {
         }
       }
 
-      // fire laser bursts (scout, heavy & colossus)
-      if (d.kind === 'scout' || d.kind === 'heavy' || d.kind === 'colossus') {
+      // Laser / plasma bursts
+      if (
+        d.kind === 'scout' ||
+        d.kind === 'heavy' ||
+        d.kind === 'colossus' ||
+        d.kind === 'phantom' ||
+        d.kind === 'shielder' ||
+        d.kind === 'titan'
+      ) {
         d.fireTimer -= dt;
         if (d.burstLeft > 0) {
           d.burstTimer -= dt;
           if (d.burstTimer <= 0) {
             d.burstLeft -= 1;
-            d.burstTimer = 0.12;
-            const from = d.group.position.clone();
-            const jitter = new THREE.Vector3((Math.random() - 0.5) * 1.4, (Math.random() - 0.5) * 1.0, (Math.random() - 0.5) * 1.4).multiplyScalar(d.spotted ? 0.4 : 1);
-            const to = playerPos.clone().add(new THREE.Vector3(0, 1.1, 0)).add(jitter);
-            this.cb.onLaser(from, to);
-            const dir = to.sub(from).normalize().multiplyScalar(19);
-            this.fireBolt(this.projectiles, this.projFree, from, dir, 3, Math.round(base.fireDamage * this.dmgMul));
+            d.burstTimer = d.kind === 'phantom' ? 0.08 : 0.12;
+            _from.copy(d.group.position);
+            const jScale = d.spotted ? 0.4 : 1;
+            _to.set(
+              playerPos.x + (Math.random() - 0.5) * 1.4 * jScale,
+              playerPos.y + 1.1 + (Math.random() - 0.5) * 1.0 * jScale,
+              playerPos.z + (Math.random() - 0.5) * 1.4 * jScale,
+            );
+            const laserCol = d.kind === 'phantom' ? '#c084fc' : d.kind === 'shielder' ? '#38bdf8' : '#ff5a4a';
+            this.cb.onLaser(_from, _to, laserCol);
+            _to.sub(_from).normalize().multiplyScalar(d.kind === 'titan' ? 23 : 19);
+            this.fireBolt(
+              this.projectiles,
+              this.projFree,
+              _from,
+              _to,
+              3,
+              Math.round(base.fireDamage * this.dmgMul),
+              d.kind === 'titan' ? 1.5 : 1,
+            );
           }
         } else if (d.fireTimer <= 0 && dist < base.attackRange) {
           d.burstLeft = base.burst;
@@ -769,23 +1011,22 @@ export class DroneManager {
         }
       }
 
-      // shield ripple
       if (d.shieldMat && d.shield > 0) {
         d.shieldMat.opacity = 0.16 + 0.08 * Math.sin(time * 5 + d.phase);
       }
     }
 
-    // projectiles (laser bolts are blocked by buildings; fast bolts sweep-tested)
+    // Projectiles update
+    _bodyTop.set(playerPos.x, playerPos.y + 1.8, playerPos.z);
     for (let i = 0; i < this.projectiles.length; i++) {
       const p = this.projectiles[i];
       if (p.life <= 0) continue;
-      const prev = p.mesh.position.clone();
+      _prev.copy(p.mesh.position);
       p.mesh.position.addScaledVector(p.vel, dt);
       p.life -= dt;
       const pp = p.mesh.position;
       let hit = false;
-      // swept test against the player's body capsule (feet → head)
-      if (alive && segSegDist(prev, pp, playerPos, bodyTop(playerPos)) < 0.45) {
+      if (alive && segSegDist(_prev, pp, playerPos, _bodyTop) < 0.45) {
         this.cb.onPlayerHit(p.dmg, pp);
         hit = true;
       }
@@ -794,7 +1035,7 @@ export class DroneManager {
       if (hit) DroneManager.release(this.projectiles, this.projFree, i);
     }
 
-    // bomber drop-shots: gravity fall, detonate on ground or building
+    // Bomber gravity bombs
     for (let i = 0; i < this.bombs.length; i++) {
       const b = this.bombs[i];
       if (b.life <= 0) continue;
@@ -810,9 +1051,9 @@ export class DroneManager {
     }
   }
 
-  /** True when a world point sits inside a collider volume below its top face. */
   private solidAt(p: THREE.Vector3): boolean {
-    for (const c of this.colliders) {
+    for (let i = 0; i < this.colliders.length; i++) {
+      const c = this.colliders[i];
       if (p.y >= c.top) continue;
       if (c.kind === 'cyl') {
         if (Math.hypot(p.x - c.x, p.z - c.z) < c.r) return true;
@@ -821,9 +1062,6 @@ export class DroneManager {
     return false;
   }
 
-  /** Wall-following: when last frame's collision pushed us out, strip the
-   *  into-wall steering component and add a tangential one so drones slide
-   *  along the obstacle to a way around instead of grinding into it. */
   private applyWallSlide(d: Drone, desired: THREE.Vector3, speed: number): void {
     const n = d.hitN;
     if (!n) return;
@@ -832,8 +1070,8 @@ export class DroneManager {
     n.divideScalar(len);
     const into = desired.dot(n);
     if (into > 0) desired.addScaledVector(n, -into);
-    const tangent = new THREE.Vector3(-n.z, 0, n.x).multiplyScalar(d.strafe);
-    desired.addScaledVector(tangent, speed * 0.85);
+    _tangent.set(-n.z, 0, n.x).multiplyScalar(d.strafe);
+    desired.addScaledVector(_tangent, speed * 0.85);
   }
 
   private steer(d: Drone, desired: THREE.Vector3, dt: number, maxSpeed: number): void {
@@ -843,7 +1081,7 @@ export class DroneManager {
     d.group.position.addScaledVector(d.vel, dt);
     const minY = d.kind === 'crawler' ? 0.75 : 1.2;
     if (d.group.position.y < minY) d.group.position.y = minY;
-    if (d.group.position.y > 9) d.group.position.y = 9;
+    if (d.group.position.y > 9.5) d.group.position.y = 9.5;
     const r = Math.hypot(d.group.position.x, d.group.position.z);
     if (r > 50) {
       d.group.position.x *= 50 / r;
@@ -852,14 +1090,13 @@ export class DroneManager {
     this.resolveCollision(d);
   }
 
-  /** Push drones out of buildings/terrain so they can never clip through walls.
-   *  Only blocks when the drone belly is below the collider top, so high drones
-   *  can legally overfly low structures (shack roof, blast walls, containers). */
   private resolveCollision(d: Drone): void {
     const p = d.group.position;
     const pad = d.radius + 0.35;
-    d.hitN = null;
-    for (const c of this.colliders) {
+    if (d.hitN) d.hitN.set(0, 0, 0);
+    let hadHit = false;
+    for (let i = 0; i < this.colliders.length; i++) {
+      const c = this.colliders[i];
       if (p.y - 0.4 >= c.top) continue;
       if (c.kind === 'cyl') {
         const dx = p.x - c.x;
@@ -876,8 +1113,10 @@ export class DroneManager {
             d.vel.x += nx * into;
             d.vel.z += nz * into;
           }
-          if (d.hitN) d.hitN.add(new THREE.Vector3(nx, 0, nz));
-          else d.hitN = new THREE.Vector3(nx, 0, nz);
+          if (!d.hitN) d.hitN = new THREE.Vector3();
+          d.hitN.x += nx;
+          d.hitN.z += nz;
+          hadHit = true;
         }
       } else {
         const dx = p.x - c.x;
@@ -896,10 +1135,13 @@ export class DroneManager {
             p.z += nz * oz;
             if ((dz >= 0 ? d.vel.z : -d.vel.z) < 0) d.vel.z = 0;
           }
-          if (d.hitN) d.hitN.add(new THREE.Vector3(nx, 0, nz));
-          else d.hitN = new THREE.Vector3(nx, 0, nz);
+          if (!d.hitN) d.hitN = new THREE.Vector3();
+          d.hitN.x += nx;
+          d.hitN.z += nz;
+          hadHit = true;
         }
       }
     }
+    if (!hadHit) d.hitN = null;
   }
 }

@@ -95,6 +95,48 @@ export function buildCrater(scene: THREE.Scene): WorldBundle {
   group.add(wreck);
   colliders.push({ kind: 'box', x: 22, z: 30, hx: 3.4, hz: 1.7, r: 0, top: 2.6 });
 
+  // Glowing volcanic magma fissures radiating from the outer caldera
+  const magmaMat = new THREE.MeshStandardMaterial({
+    color: 0x3b0a0a,
+    emissive: new THREE.Color('#f97316'),
+    emissiveIntensity: 2.2,
+    roughness: 0.3,
+  });
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2 + 0.2;
+    const vein = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.06, 14), magmaMat);
+    vein.position.set(Math.cos(a) * 26, 0.04, Math.sin(a) * 26);
+    vein.rotation.y = a + 0.3;
+    group.add(vein);
+  }
+
+  // Downed Orbital Relay Satellite wreck (NW quadrant)
+  const sat = new THREE.Group();
+  const satCore = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.2, 1.2, 3.8, 8),
+    new THREE.MeshStandardMaterial({ color: 0xd97706, roughness: 0.35, metalness: 0.8 }),
+  );
+  satCore.rotation.z = 1.1;
+  satCore.position.y = 1.3;
+  sat.add(satCore);
+  const solarMat = new THREE.MeshStandardMaterial({
+    color: 0x1e3a8a,
+    emissive: new THREE.Color('#1d4ed8'),
+    emissiveIntensity: 0.4,
+    roughness: 0.2,
+    metalness: 0.9,
+  });
+  for (const side of [-1, 1]) {
+    const wing = new THREE.Mesh(new THREE.BoxGeometry(4.6, 0.08, 1.6), solarMat);
+    wing.position.set(side * 3.1, 1.4 + side * 0.4, 0);
+    wing.rotation.z = 0.25;
+    sat.add(wing);
+  }
+  sat.position.set(-22, 0, -24);
+  sat.rotation.y = 0.8;
+  group.add(sat);
+  colliders.push({ kind: 'box', x: -22, z: -24, hx: 3.2, hz: 1.8, r: 0, top: 2.6 });
+
   // blood-dusk cloud band
   const cloudMat = new THREE.MeshStandardMaterial({ color: 0x120a10, roughness: 1, fog: true });
   for (let i = 0; i < 10; i++) {

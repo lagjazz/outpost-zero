@@ -69,6 +69,7 @@ export function buildCanyon(scene: THREE.Scene): WorldBundle {
     m.compose(r.position, r.quaternion, r.scale);
     walls.setMatrixAt(i, m);
   });
+  walls.computeBoundingSphere();
   group.add(walls);
   // snow dust on wall tops
   const caps: THREE.Mesh[] = [];
@@ -83,6 +84,7 @@ export function buildCanyon(scene: THREE.Scene): WorldBundle {
     m.makeRotationY(c.rotation.y).setPosition(c.position);
     capMesh.setMatrixAt(i, m);
   });
+  capMesh.computeBoundingSphere();
   group.add(capMesh);
 
   // distant outer walls for depth (visual only)
@@ -95,6 +97,26 @@ export function buildCanyon(scene: THREE.Scene): WorldBundle {
       far.rotation.y = (Math.random() - 0.5) * 0.4;
       group.add(far);
     }
+  }
+
+  // Overhead Steel Truss Bridge spanning the canyon at z = -26
+  const bridgeMat = new THREE.MeshStandardMaterial({ color: 0x2b3545, roughness: 0.55, metalness: 0.7 });
+  const deck = new THREE.Mesh(new THREE.BoxGeometry(54, 1.2, 4.6), bridgeMat);
+  deck.position.set(0, 14.5, -26);
+  deck.castShadow = true;
+  group.add(deck);
+  for (const bz of [-28.1, -23.9]) {
+    const truss = new THREE.Mesh(new THREE.BoxGeometry(54, 2.4, 0.35), bridgeMat);
+    truss.position.set(0, 16.0, bz);
+    group.add(truss);
+  }
+  for (const bx of [-16, 0, 16]) {
+    const beacon = new THREE.Mesh(
+      new THREE.SphereGeometry(0.28, 8, 8),
+      new THREE.MeshStandardMaterial({ color: 0x220808, emissive: new THREE.Color('#f59e0b'), emissiveIntensity: 2.0 }),
+    );
+    beacon.position.set(bx, 17.4, -23.9);
+    group.add(beacon);
   }
 
   // scattered boulders in the corridor
@@ -129,6 +151,7 @@ export function buildCanyon(scene: THREE.Scene): WorldBundle {
   }
   snags.count = placed;
   snags.castShadow = true;
+  snags.computeBoundingSphere();
   group.add(snags);
 
   // ---- cover: shipping containers + a wrecked hauler (axis-aligned colliders)
@@ -176,6 +199,7 @@ export function buildCanyon(scene: THREE.Scene): WorldBundle {
     m.makeTranslation(Math.cos(a) * 15.5, 0.7, Math.sin(a) * 15.5);
     posts.setMatrixAt(i, m);
   }
+  posts.computeBoundingSphere();
   group.add(posts);
 
   return {

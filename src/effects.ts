@@ -1,16 +1,12 @@
-// Pooled visual effects: tracers, sparks, explosions, debris, EMP ring.
-//
-// Every pool object is built in the constructor and sits in the scene hidden,
-// so the boot warm-up (main.ts warmHostiles: compile + render with everything
-// visible) pre-compiles every program and uploads every geometry/texture here.
-// Firing and kills only flip slots visible and move them — no allocations, no
-// material dispose churn, no mid-fight shader compiles or texture uploads.
+// Pooled visual effects: tracers, sparks, explosions, shockwave rings, debris, EMP ring.
+// Zero per-frame allocations: all pools and scratch vectors are pre-allocated at boot.
 import * as THREE from 'three';
 
-const TRACER_POOL = 64;
-const SPRITE_POOL = 320; // sparks, fireballs, shield ripples (fog off)
-const SMOKE_POOL = 48; // airdrop plumes use a fog-lit variant → separate program key
+const TRACER_POOL = 80;
+const SPRITE_POOL = 340;
+const SMOKE_POOL = 56;
 const DEBRIS_POOL = 96;
+const RING_POOL = 24;
 
 interface TracerSlot {
   mesh: THREE.Mesh;
@@ -33,6 +29,13 @@ interface DebrisSlot {
   spin: THREE.Vector3;
   life: number;
 }
+interface RingSlot {
+  mesh: THREE.Mesh;
+  mat: THREE.MeshBasicMaterial;
+  life: number;
+  max: number;
+  maxScale: number;
+}
 
 function circleTexture(hex: string): THREE.CanvasTexture {
   const c = document.createElement('canvas');
@@ -40,23 +43,36 @@ function circleTexture(hex: string): THREE.CanvasTexture {
   const ctx = c.getContext('2d')!;
   const g = ctx.createRadialGradient(32, 32, 2, 32, 32, 30);
   g.addColorStop(0, hex);
+  g.addColorStop(0.5, hex);
   g.addColorStop(1, 'rgba(0,0,0,0)');
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, 64, 64);
-  return new THREE.CanvasTexture(c);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
 }
 
-const tracerGeo = new THREE.CylinderGeometry(0.018, 0.006, 1, 5);
+const tracerGeo = new THREE.CylinderGeometry(0.022, 0.008, 1, 6);
 tracerGeo.translate(0, 0.5, 0);
 tracerGeo.rotateX(Math.PI / 2);
 
-const debrisGeo = new THREE.BoxGeometry(1, 1, 1); // unit cube; size via mesh.scale
+const debrisGeo = new THREE.DodecahedronGeometry(0.65, 0);
 const debrisMat = new THREE.MeshStandardMaterial({
   color: 0x2b313c,
   emissive: new THREE.Color('#ff7a30'),
-  emissiveIntensity: 0.8,
-  roughness: 0.6,
+  emissiveIntensity: 0.9,
+  roughness: 0.5,
+  metalness: 0.5,
 });
+
+const ringGeo = new THREE.RingGeometry(0.65, 1.0, 28);
+ringGeo.rotateX(-Math.PI / 2);
+
+const _amberCol = new THREE.Color('#ffb45e');
+const _cyanCol = new THREE.Color('#22d3ee');
+const _redCol = new THREE.Color('#ff5a3c');
+const _violetCol = new THREE.Color('#c084fc');
+const _mid = new THREE.Vector3();
 
 export class Effects {
   private tracers: TracerSlot[] = [];
@@ -71,15 +87,18 @@ export class Effects {
   private debris: DebrisSlot[] = [];
   private debrisActive: number[] = [];
   private debrisFree: number[] = [];
-  // fixed light pool — adding/removing lights from the scene would trigger
-  // shader recompiles; we keep a constant count and just animate intensity.
+  private rings: RingSlot[] = [];
+  private ringActive: number[] = [];
+  private ringFree: number[] = [];
+
   private poolSize = 10;
   private pool: { light: THREE.PointLight; life: number; life0: number; peak: number }[] = [];
   private empRing: THREE.Mesh;
   private empTime = -1;
-  private sparkTex = circleTexture('rgba(255,200,120,0.9)');
-  private cyanTex = circleTexture('rgba(80,220,255,0.9)');
-  private fireTex = circleTexture('rgba(255,120,40,0.9)');
+  private sparkTex = circleTexture('rgba(255,210,130,0.95)');
+  private cyanTex = circleTexture('rgba(80,230,255,0.95)');
+  private fireTex = circleTexture('rgba(255,120,40,0.95)');
+  private violetTex = circleTexture('rgba(192,132,252,0.95)');
 
   constructor(private scene: THREE.Scene) {
     for (let i = 0; i < this.poolSize; i++) {
@@ -89,41 +108,70 @@ export class Effects {
       this.pool.push({ light, life: 0, life0: 1, peak: 0 });
     }
     this.empRing = new THREE.Mesh(
-      new THREE.TorusGeometry(1, 0.25, 8, 40),
-      new THREE.MeshBasicMaterial({ color: new THREE.Color('#67e8f9'), transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }),
+      new THREE.TorusGeometry(1, 0.25, 8, 44),
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color('#67e8f9'),
+        transparent: true,
+        opacity: 0.85,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        fog: false,
+      }),
     );
     this.empRing.rotation.x = Math.PI / 2;
     this.empRing.visible = false;
     scene.add(this.empRing);
 
-    // --- pools (hidden until used; boot warm-up paints them once) ---
     for (let i = 0; i < TRACER_POOL; i++) {
-      const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false });
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        fog: false,
+      });
       const mesh = new THREE.Mesh(tracerGeo, mat);
       mesh.visible = false;
       scene.add(mesh);
       this.tracers.push({ mesh, mat, life: 0, max: 1 });
       this.tracerFree.push(i);
     }
-    // seed the first slots with every circle texture so the boot warm-up
-    // paints (uploads) all three, not just the one they happen to start on
-    const seed = [this.fireTex, this.sparkTex, this.cyanTex];
+
+    const seed = [this.fireTex, this.sparkTex, this.cyanTex, this.violetTex];
     for (let i = 0; i < SPRITE_POOL; i++) {
-      const mat = new THREE.SpriteMaterial({ map: seed[i % seed.length], color: 0xffffff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false });
+      const mat = new THREE.SpriteMaterial({
+        map: seed[i % seed.length],
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        fog: false,
+      });
       const sprite = new THREE.Sprite(mat);
       sprite.visible = false;
       scene.add(sprite);
       this.sprites.push({ sprite, mat, vel: new THREE.Vector3(), life: 0, max: 1, grav: 0, size0: 1 });
       this.spriteFree.push(i);
     }
+
     for (let i = 0; i < SMOKE_POOL; i++) {
-      const mat = new THREE.SpriteMaterial({ map: this.fireTex, color: new THREE.Color('#ff9a3c'), transparent: true, opacity: 0, depthWrite: false, fog: true });
+      const mat = new THREE.SpriteMaterial({
+        map: this.fireTex,
+        color: new THREE.Color('#ff9a3c'),
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        fog: true,
+      });
       const sprite = new THREE.Sprite(mat);
       sprite.visible = false;
       scene.add(sprite);
       this.smokes.push({ sprite, mat, vel: new THREE.Vector3(), life: 0, max: 1, grav: 0, size0: 1 });
       this.smokeFree.push(i);
     }
+
     for (let i = 0; i < DEBRIS_POOL; i++) {
       const mesh = new THREE.Mesh(debrisGeo, debrisMat);
       mesh.visible = false;
@@ -131,14 +179,29 @@ export class Effects {
       this.debris.push({ mesh, vel: new THREE.Vector3(), spin: new THREE.Vector3(), life: 0 });
       this.debrisFree.push(i);
     }
+
+    for (let i = 0; i < RING_POOL; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xffa040,
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        fog: false,
+      });
+      const mesh = new THREE.Mesh(ringGeo, mat);
+      mesh.visible = false;
+      scene.add(mesh);
+      this.rings.push({ mesh, mat, life: 0, max: 0.45, maxScale: 6 });
+      this.ringFree.push(i);
+    }
   }
 
-  /** Grab a free slot; if the pool is saturated, recycle the oldest active one.
-   *  Returns the index and leaves it registered in `active`. */
   private static take(active: number[], free: number[]): number {
     let i = free.pop();
     if (i === undefined) {
-      i = active.shift()!; // steal oldest — visual saturation guard, never allocates
+      i = active.shift()!;
     }
     active.push(i);
     return i;
@@ -150,13 +213,13 @@ export class Effects {
     if (k >= 0) active.splice(k, 1);
   }
 
-  tracer(from: THREE.Vector3, to: THREE.Vector3, color: string, life = 0.07): void {
+  tracer(from: THREE.Vector3, to: THREE.Vector3, color: string, life = 0.075, widthScale = 1): void {
     const i = Effects.take(this.tracerActive, this.tracerFree);
     const t = this.tracers[i];
     t.mat.color.set(color);
     t.mat.opacity = 0.95;
     const len = from.distanceTo(to);
-    t.mesh.scale.set(1, 1, Math.max(0.1, len));
+    t.mesh.scale.set(widthScale, widthScale, Math.max(0.1, len));
     t.mesh.position.copy(from);
     t.mesh.lookAt(to);
     t.mesh.visible = true;
@@ -164,56 +227,87 @@ export class Effects {
     t.max = life;
   }
 
-  sparks(pos: THREE.Vector3, color: 'amber' | 'cyan' | 'red', count = 8): void {
-    const tex = color === 'cyan' ? this.cyanTex : color === 'red' ? this.fireTex : this.sparkTex;
-    const base = color === 'cyan' ? new THREE.Color('#22d3ee') : color === 'red' ? new THREE.Color('#ff5a3c') : new THREE.Color('#ffb45e');
+  /** Jagged two-segment plasma / lightning arc between two points. */
+  arcBeam(from: THREE.Vector3, to: THREE.Vector3, color = '#38e2ff'): void {
+    _mid.lerpVectors(from, to, 0.5);
+    _mid.x += (Math.random() - 0.5) * 1.1;
+    _mid.y += (Math.random() - 0.5) * 0.9;
+    _mid.z += (Math.random() - 0.5) * 1.1;
+    this.tracer(from, _mid, color, 0.14, 1.8);
+    this.tracer(_mid, to, color, 0.14, 1.8);
+    this.sparks(to, 'cyan', 5);
+  }
+
+  shockwave(pos: THREE.Vector3, color = '#ffa040', maxScale = 5.5, life = 0.42): void {
+    const i = Effects.take(this.ringActive, this.ringFree);
+    const r = this.rings[i];
+    r.mat.color.set(color);
+    r.mat.opacity = 0.85;
+    r.mesh.position.set(pos.x, Math.max(0.12, pos.y), pos.z);
+    r.mesh.scale.setScalar(0.3);
+    r.mesh.visible = true;
+    r.life = life;
+    r.max = life;
+    r.maxScale = maxScale;
+  }
+
+  sparks(pos: THREE.Vector3, color: 'amber' | 'cyan' | 'red' | 'violet', count = 8): void {
+    const tex =
+      color === 'cyan' ? this.cyanTex : color === 'red' ? this.fireTex : color === 'violet' ? this.violetTex : this.sparkTex;
+    const base =
+      color === 'cyan' ? _cyanCol : color === 'red' ? _redCol : color === 'violet' ? _violetCol : _amberCol;
     for (let n = 0; n < count; n++) {
       const i = Effects.take(this.spriteActive, this.spriteFree);
       const p = this.sprites[i];
       p.mat.map = tex;
       p.mat.color.copy(base);
       p.mat.opacity = 1;
-      const size = 0.08 + Math.random() * 0.12;
+      const size = 0.1 + Math.random() * 0.14;
       p.sprite.scale.set(size, size, 1);
       p.sprite.position.copy(pos);
       p.sprite.visible = true;
-      p.vel.set((Math.random() - 0.5) * 5, (Math.random() - 0.3) * 5, (Math.random() - 0.5) * 5);
-      p.life = 0.3 + Math.random() * 0.4;
-      p.max = 0.7;
-      p.grav = 6;
+      p.vel.set((Math.random() - 0.5) * 5.8, (Math.random() - 0.25) * 5.5, (Math.random() - 0.5) * 5.8);
+      p.life = 0.28 + Math.random() * 0.36;
+      p.max = 0.65;
+      p.grav = 6.5;
       p.size0 = size;
     }
   }
 
-  explosion(pos: THREE.Vector3, scale = 1): void {
-    // fireball sprites
-    for (let n = 0; n < 10; n++) {
+  explosion(pos: THREE.Vector3, scale = 1, tint: 'fire' | 'cyan' | 'violet' = 'fire'): void {
+    const c1 = tint === 'cyan' ? '#67e8f9' : tint === 'violet' ? '#e879f9' : '#ffd27f';
+    const c2 = tint === 'cyan' ? '#06b6d4' : tint === 'violet' ? '#9333ea' : '#ff5a2c';
+    for (let n = 0; n < 12; n++) {
       const i = Effects.take(this.spriteActive, this.spriteFree);
       const p = this.sprites[i];
-      p.mat.map = this.fireTex;
-      p.mat.color.set(n < 5 ? '#ffd27f' : '#ff5a2c');
+      p.mat.map = tint === 'cyan' ? this.cyanTex : tint === 'violet' ? this.violetTex : this.fireTex;
+      p.mat.color.set(n < 6 ? c1 : c2);
       p.mat.opacity = 1;
-      const size = (0.6 + Math.random() * 1.2) * scale;
+      const size = (0.65 + Math.random() * 1.35) * scale;
       p.sprite.scale.set(size, size, 1);
-      p.sprite.position.copy(pos).add(new THREE.Vector3((Math.random() - 0.5) * scale, (Math.random() - 0.5) * scale, (Math.random() - 0.5) * scale));
+      p.sprite.position.set(
+        pos.x + (Math.random() - 0.5) * scale,
+        pos.y + (Math.random() - 0.5) * scale,
+        pos.z + (Math.random() - 0.5) * scale,
+      );
       p.sprite.visible = true;
-      p.vel.set((Math.random() - 0.5) * 6 * scale, Math.random() * 4 * scale, (Math.random() - 0.5) * 6 * scale);
+      p.vel.set((Math.random() - 0.5) * 6.5 * scale, Math.random() * 4.5 * scale, (Math.random() - 0.5) * 6.5 * scale);
       p.life = 0.4 + Math.random() * 0.5;
       p.max = 0.9;
       p.grav = 1;
       p.size0 = size;
     }
-    this.flash(pos, '#ffa040', 160 * scale, 26 * scale, 0.35);
-    // debris cubes (shared unit geometry + material; size via scale)
-    for (let n = 0; n < 6; n++) {
+    this.shockwave(pos, c1, 4.8 * scale, 0.45);
+    this.flash(pos, c1, 170 * scale, 28 * scale, 0.38);
+    for (let n = 0; n < 7; n++) {
       const i = Effects.take(this.debrisActive, this.debrisFree);
       const d = this.debris[i];
-      const s = 0.08 + Math.random() * 0.16;
+      const s = 0.09 + Math.random() * 0.18;
       d.mesh.scale.set(s, s, s);
       d.mesh.position.copy(pos);
       d.mesh.rotation.set(0, 0, 0);
       d.mesh.visible = true;
-      d.vel.set((Math.random() - 0.5) * 9, 2 + Math.random() * 6, (Math.random() - 0.5) * 9);
+      d.vel.set((Math.random() - 0.5) * 10, 2.5 + Math.random() * 6.5, (Math.random() - 0.5) * 10);
       d.spin.set(Math.random() * 10, Math.random() * 10, Math.random() * 10);
       d.life = 1.6;
     }
@@ -225,21 +319,22 @@ export class Effects {
     p.mat.map = this.cyanTex;
     p.mat.color.set('#38e2ff');
     p.mat.opacity = 1;
-    p.sprite.scale.set(0.9, 0.9, 1);
+    p.sprite.scale.set(1.05, 1.05, 1);
     p.sprite.position.copy(pos);
     p.sprite.visible = true;
     p.vel.set(0, 0, 0);
     p.life = 0.25;
     p.max = 0.25;
     p.grav = 0;
-    p.size0 = 0.9;
+    p.size0 = 1.05;
   }
 
   triggerEmp(center: THREE.Vector3): void {
     this.empRing.position.copy(center).setY(1.2);
     this.empRing.visible = true;
     this.empTime = 0;
-    this.flash(center.clone().setY(6), '#67e8f9', 900, 90, 1.2);
+    this.shockwave(center, '#67e8f9', 36, 1.1);
+    this.flash(new THREE.Vector3(center.x, 6, center.z), '#67e8f9', 900, 90, 1.2);
   }
 
   flash(pos: THREE.Vector3, color: string, peak: number, dist: number, life: number): void {
@@ -263,6 +358,18 @@ export class Effects {
       if (t.life <= 0) {
         t.mesh.visible = false;
         Effects.retire(this.tracerActive, this.tracerFree, i);
+      }
+    }
+    for (let k = this.ringActive.length - 1; k >= 0; k--) {
+      const i = this.ringActive[k];
+      const r = this.rings[i];
+      r.life -= dt;
+      const prog = 1 - Math.max(0, r.life / r.max);
+      r.mesh.scale.setScalar(0.3 + prog * r.maxScale);
+      r.mat.opacity = (1 - prog) * 0.85;
+      if (r.life <= 0) {
+        r.mesh.visible = false;
+        Effects.retire(this.ringActive, this.ringFree, i);
       }
     }
     for (const pool of [this.sprites, this.smokes]) {
@@ -319,14 +426,20 @@ export class Effects {
     }
   }
 
-  smokePlume(pos: THREE.Vector3, dt: number): void {
-    if (Math.random() > dt * 14) return;
+  smokePlume(pos: THREE.Vector3, dt: number, hexColor?: number): void {
+    if (Math.random() > dt * 15) return;
     const i = Effects.take(this.smokeActive, this.smokeFree);
     const p = this.smokes[i];
-    p.mat.opacity = 0.6;
-    const size = 0.5 + Math.random() * 0.5;
+    if (hexColor !== undefined) p.mat.color.setHex(hexColor);
+    else p.mat.color.set('#ff9a3c');
+    p.mat.opacity = 0.65;
+    const size = 0.5 + Math.random() * 0.55;
     p.sprite.scale.set(size, size, 1);
-    p.sprite.position.copy(pos).add(new THREE.Vector3((Math.random() - 0.5) * 0.3, 0, (Math.random() - 0.5) * 0.3));
+    p.sprite.position.set(
+      pos.x + (Math.random() - 0.5) * 0.3,
+      pos.y,
+      pos.z + (Math.random() - 0.5) * 0.3,
+    );
     p.sprite.visible = true;
     p.vel.set(0, 1.6, 0);
     p.life = 1.6;

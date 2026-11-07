@@ -1,34 +1,120 @@
-// Wave director: spawns drone waves from the map's spawn ring/angles and drops supply pods.
+// Wave director: spawns 10 drone classes from the map's spawn ring/angles and drops 5 diverse supply pod types.
 import * as THREE from 'three';
-import { MISSION, type WaveDef } from './config';
-import type { DroneKind, Interactable } from './state';
+import { AIRDROP_SPECS, MISSION, type WaveDef } from './config';
+import type { AirdropKind, DroneKind, Interactable } from './state';
 import type { DroneManager } from './drones';
 
 export interface Airdrop {
+  kind: AirdropKind;
   pod: THREE.Group;
+  chute: THREE.Group;
   pos: THREE.Vector3;
   landed: boolean;
   opened: boolean;
   beacon: THREE.Mesh;
+  ring: THREE.Mesh;
 }
 
-// Shared pod resources: one set of geometries/materials for every pod in every
-// map, so each drop allocates no GPU data and reuses already-compiled programs
-// (the pod materials' program keys match the drone shield / emissive variants
-// warmed at boot). The beacon pulse drives the shared material — every beacon
-// on the field pulses in sync, which reads as one network-wide signal.
-const podBodyGeo = new THREE.BoxGeometry(0.9, 0.9, 0.9);
-const podBodyMat = new THREE.MeshStandardMaterial({ color: 0x6a5a2e, roughness: 0.6, metalness: 0.3, emissive: new THREE.Color('#3a2b10'), emissiveIntensity: 0.4 });
-const podBandGeo = new THREE.BoxGeometry(0.95, 0.12, 0.95);
-const podBandMat = new THREE.MeshStandardMaterial({ color: 0x111, emissive: new THREE.Color('#f59e0b'), emissiveIntensity: 2 });
-const beaconGeo = new THREE.CylinderGeometry(1.1, 1.1, 24, 12, 1, true);
-const beaconMat = new THREE.MeshBasicMaterial({ color: new THREE.Color('#f59e0b'), transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: true });
+const podBodyGeo = new THREE.CylinderGeometry(0.52, 0.58, 1.15, 8);
+const podCapGeo = new THREE.ConeGeometry(0.56, 0.38, 8);
+const podStrutGeo = new THREE.BoxGeometry(0.12, 0.55, 0.18);
+const podBandGeo = new THREE.CylinderGeometry(0.6, 0.6, 0.16, 8);
+const beaconGeo = new THREE.CylinderGeometry(0.85, 0.85, 24, 12, 1, true);
+const ringGeo = new THREE.RingGeometry(1.1, 1.35, 24);
+ringGeo.rotateX(-Math.PI / 2);
+const chuteDomeGeo = new THREE.SphereGeometry(1.65, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.55);
+const chuteCordGeo = new THREE.CylinderGeometry(0.015, 0.015, 2.8, 4);
+
+const podBaseMat = new THREE.MeshStandardMaterial({
+  color: 0x333c4a,
+  roughness: 0.45,
+  metalness: 0.72,
+});
+const podStrutMat = new THREE.MeshStandardMaterial({
+  color: 0x1e242d,
+  roughness: 0.6,
+  metalness: 0.5,
+});
+const chuteMat = new THREE.MeshStandardMaterial({
+  color: 0xd97706,
+  roughness: 0.85,
+  metalness: 0.05,
+  side: THREE.DoubleSide,
+});
+
+const AIRDROP_ROTATION: AirdropKind[] = ['munitions', 'sentry', 'medical', 'emp', 'prototype'];
+
+const bandMats: Record<AirdropKind, THREE.MeshStandardMaterial> = {
+  munitions: new THREE.MeshStandardMaterial({ color: 0x111111, emissive: new THREE.Color('#f59e0b'), emissiveIntensity: 2.2 }),
+  medical: new THREE.MeshStandardMaterial({ color: 0x111111, emissive: new THREE.Color('#10b981'), emissiveIntensity: 2.2 }),
+  sentry: new THREE.MeshStandardMaterial({ color: 0x111111, emissive: new THREE.Color('#06b6d4'), emissiveIntensity: 2.2 }),
+  emp: new THREE.MeshStandardMaterial({ color: 0x111111, emissive: new THREE.Color('#a855f7'), emissiveIntensity: 2.2 }),
+  prototype: new THREE.MeshStandardMaterial({ color: 0x111111, emissive: new THREE.Color('#eab308'), emissiveIntensity: 2.5 }),
+};
+
+const beaconMats: Record<AirdropKind, THREE.MeshBasicMaterial> = {
+  munitions: new THREE.MeshBasicMaterial({ color: new THREE.Color('#f59e0b'), transparent: true, opacity: 0.2, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
+  medical: new THREE.MeshBasicMaterial({ color: new THREE.Color('#10b981'), transparent: true, opacity: 0.2, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
+  sentry: new THREE.MeshBasicMaterial({ color: new THREE.Color('#06b6d4'), transparent: true, opacity: 0.2, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
+  emp: new THREE.MeshBasicMaterial({ color: new THREE.Color('#a855f7'), transparent: true, opacity: 0.2, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
+  prototype: new THREE.MeshBasicMaterial({ color: new THREE.Color('#eab308'), transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
+};
+
+function buildPodMesh(kind: AirdropKind): { pod: THREE.Group; chute: THREE.Group; beacon: THREE.Mesh; ring: THREE.Mesh } {
+  const pod = new THREE.Group();
+  const body = new THREE.Mesh(podBodyGeo, podBaseMat);
+  body.position.y = 0.58;
+  body.castShadow = true;
+  pod.add(body);
+
+  const cap = new THREE.Mesh(podCapGeo, podStrutMat);
+  cap.position.y = 1.34;
+  pod.add(cap);
+
+  for (let i = 0; i < 4; i++) {
+    const a = (i / 4) * Math.PI * 2 + Math.PI / 4;
+    const strut = new THREE.Mesh(podStrutGeo, podStrutMat);
+    strut.position.set(Math.cos(a) * 0.54, 0.3, Math.sin(a) * 0.54);
+    strut.rotation.y = -a;
+    pod.add(strut);
+  }
+
+  const band = new THREE.Mesh(podBandGeo, bandMats[kind]);
+  band.position.y = 0.65;
+  pod.add(band);
+
+  const beacon = new THREE.Mesh(beaconGeo, beaconMats[kind]);
+  beacon.position.y = 12;
+  pod.add(beacon);
+
+  const ring = new THREE.Mesh(ringGeo, beaconMats[kind]);
+  ring.position.y = 0.04;
+  pod.add(ring);
+
+  // Parachute assembly visible while descending
+  const chute = new THREE.Group();
+  const dome = new THREE.Mesh(chuteDomeGeo, chuteMat);
+  dome.position.y = 3.6;
+  chute.add(dome);
+  for (let i = 0; i < 4; i++) {
+    const a = (i / 4) * Math.PI * 2;
+    const cord = new THREE.Mesh(chuteCordGeo, podStrutMat);
+    cord.position.set(Math.cos(a) * 0.75, 2.3, Math.sin(a) * 0.75);
+    cord.rotation.z = Math.cos(a) * 0.32;
+    cord.rotation.x = -Math.sin(a) * 0.32;
+    chute.add(cord);
+  }
+  pod.add(chute);
+
+  return { pod, chute, beacon, ring };
+}
 
 export class WaveDirector {
   private kindQueue: DroneKind[] = [];
   private spawnTimer = 0;
   private lastWave = 0;
   private airDropsDone = new Set<number>();
+  private dropCounter = 0;
   airdrops: Airdrop[] = [];
   waveBanner: { title: string; sub: string } | null = null;
 
@@ -39,18 +125,12 @@ export class WaveDirector {
     private waves: WaveDef[],
     private spawnAngle: () => number,
   ) {
-    // hidden template pod so the boot warm-up uploads pod geometry/textures;
-    // the first live airdrop then paints nothing new.
-    const t = new THREE.Group();
-    const body = new THREE.Mesh(podBodyGeo, podBodyMat);
-    body.position.y = 0.45;
-    const band = new THREE.Mesh(podBandGeo, podBandMat);
-    band.position.y = 0.45;
-    const beacon = new THREE.Mesh(beaconGeo, beaconMat);
-    beacon.position.y = 12;
-    t.add(body, band, beacon);
-    t.visible = false;
-    scene.add(t);
+    // Hidden template pods for each airdrop kind so boot warm-up compiles all materials
+    for (const k of AIRDROP_ROTATION) {
+      const { pod } = buildPodMesh(k);
+      pod.visible = false;
+      scene.add(pod);
+    }
   }
 
   reset(): void {
@@ -58,9 +138,9 @@ export class WaveDirector {
     this.spawnTimer = 0;
     this.lastWave = 0;
     this.airDropsDone.clear();
+    this.dropCounter = 0;
   }
 
-  /** Wave index (1-based) that the progress has reached, 0 if none. */
   waveForProgress(progress: number): number {
     let w = 0;
     for (let i = 0; i < this.waves.length; i++) if (progress >= this.waves[i].atProgress) w = i + 1;
@@ -85,12 +165,18 @@ export class WaveDirector {
       add('bomber', def.bombers ?? 0);
       add('crawler', def.crawlers ?? 0);
       add('colossus', def.colossi ?? 0);
-      // shuffle so waves feel mixed
+      add('phantom', def.phantoms ?? 0);
+      add('shielder', def.shielders ?? 0);
+      add('titan', def.titans ?? 0);
+
       for (let i = this.kindQueue.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [this.kindQueue[i], this.kindQueue[j]] = [this.kindQueue[j], this.kindQueue[i]];
       }
-      this.waveBanner = { title: `Wave ${wave} incoming`, sub: wave === this.waves.length ? 'Final hold — all hands to battle stations' : `Hostile units: ${this.kindQueue.length}` };
+      this.waveBanner = {
+        title: `Wave ${wave} Incoming`,
+        sub: wave === this.waves.length ? 'Final assault — all hostile classes converging' : `Hostile signatures detected: ${this.kindQueue.length}`,
+      };
     }
 
     if (this.kindQueue.length > 0) {
@@ -99,17 +185,28 @@ export class WaveDirector {
         const kind = this.kindQueue.shift()!;
         const a = this.spawnAngle();
         const r = 44 + Math.random() * 6;
-        const y = kind === 'crawler' ? 0.6 : kind === 'heavy' || kind === 'bomber' ? 5.5 : kind === 'warden' ? 6.5 : kind === 'colossus' ? 5 : 2.5 + Math.random() * 4;
+        const y =
+          kind === 'crawler'
+            ? 0.6
+            : kind === 'heavy' || kind === 'bomber'
+              ? 5.5
+              : kind === 'warden' || kind === 'titan'
+                ? 6.5
+                : kind === 'colossus' || kind === 'shielder'
+                  ? 5.0
+                  : 2.8 + Math.random() * 3.8;
         this.drones.spawn(kind, new THREE.Vector3(Math.cos(a) * r, y, Math.sin(a) * r));
         this.spawnTimer = def.spawnGap * (0.7 + Math.random() * 0.6);
       }
     }
 
-    // airdrops at progress checkpoints
+    // Airdrops at progress checkpoints
     for (const cp of MISSION.airdropProgress) {
       if (progress >= cp && !this.airDropsDone.has(cp)) {
         this.airDropsDone.add(cp);
-        this.dropAirdrop();
+        const kind = AIRDROP_ROTATION[this.dropCounter % AIRDROP_ROTATION.length];
+        this.dropCounter++;
+        this.dropAirdrop(kind);
       }
     }
   }
@@ -118,18 +215,16 @@ export class WaveDirector {
     return this.kindQueue.length > 0;
   }
 
-  /** Find a drop site that is provably clear of every collider — random sample
-   *  first, then a deterministic ring scan so a pod can never land buried in a wall. */
-  private findDropSite(pad = 2.2): { x: number; z: number } {
+  findDropSite(pad = 2.4): { x: number; z: number } {
     for (let t = 0; t < 60; t++) {
       const a = Math.random() * Math.PI * 2;
-      const r = 17 + Math.random() * 12;
+      const r = 16 + Math.random() * 13;
       const x = Math.cos(a) * r;
       const z = Math.sin(a) * r;
       if (!this.nearCollider(x, z, pad)) return { x, z };
     }
     for (const ringPad of [pad, pad * 0.6]) {
-      for (let r = 16; r <= 30; r += 1.5) {
+      for (let r = 15; r <= 30; r += 1.5) {
         for (let i = 0; i < 24; i++) {
           const a = (i / 24) * Math.PI * 2 + r * 0.35;
           const x = Math.cos(a) * r;
@@ -138,28 +233,24 @@ export class WaveDirector {
         }
       }
     }
-    return { x: 0, z: 0 }; // center of the outpost yard
+    return { x: 0, z: 4 };
   }
 
-  private dropAirdrop(): void {
-    const { x: px, z: pz } = this.findDropSite();
-
-    const pod = new THREE.Group();
-    const body = new THREE.Mesh(podBodyGeo, podBodyMat);
-    body.position.y = 0.45;
-    pod.add(body);
-    const band = new THREE.Mesh(podBandGeo, podBandMat);
-    band.position.y = 0.45;
-    pod.add(band);
-    const beacon = new THREE.Mesh(beaconGeo, beaconMat);
-    beacon.position.y = 12;
-    pod.add(beacon);
-    const glow = new THREE.PointLight(new THREE.Color('#f59e0b'), 40, 16, 1.6);
-    glow.position.y = 1.5;
-    pod.add(glow);
-    pod.position.set(px, 40, pz);
+  dropAirdrop(kind: AirdropKind = 'munitions', customPos?: { x: number; z: number }): void {
+    const { x: px, z: pz } = customPos ?? this.findDropSite();
+    const { pod, chute, beacon, ring } = buildPodMesh(kind);
+    pod.position.set(px, 38, pz);
     this.scene.add(pod);
-    this.airdrops.push({ pod, pos: new THREE.Vector3(px, 0, pz), landed: false, opened: false, beacon });
+    this.airdrops.push({
+      kind,
+      pod,
+      chute,
+      pos: new THREE.Vector3(px, 0, pz),
+      landed: false,
+      opened: false,
+      beacon,
+      ring,
+    });
   }
 
   private nearCollider(x: number, z: number, pad: number): boolean {
@@ -171,24 +262,46 @@ export class WaveDirector {
     return false;
   }
 
-  updateAirdrops(dt: number, addInteractable: (it: Interactable) => void, removeInteractable: (id: string) => void): void {
+  updateAirdrops(
+    dt: number,
+    addInteractable: (it: Interactable) => void,
+    removeInteractable: (id: string) => void,
+    onClaim?: (a: Airdrop) => void,
+  ): void {
+    const pulse = 0.15 + 0.12 * Math.abs(Math.sin(performance.now() * 0.0035));
+    for (const k of AIRDROP_ROTATION) {
+      beaconMats[k].opacity = pulse;
+    }
+
     for (const a of this.airdrops) {
       if (a.opened) continue;
       if (!a.landed) {
-        a.pod.position.y -= 9 * dt;
+        a.pod.position.y -= 9.5 * dt;
+        a.pod.rotation.y += dt * 0.8;
         if (a.pod.position.y <= 0) {
           a.pod.position.y = 0;
           a.landed = true;
-          addInteractable({ id: `airdrop-${a.pos.x.toFixed(1)}-${a.pos.z.toFixed(1)}`, kind: 'airdrop', pos: new THREE.Vector3(a.pos.x, 1, a.pos.z), label: 'Open airdrop crate', readyAt: 0, remove: () => this.openAirdrop(a, removeInteractable) });
+          a.chute.visible = false; // collapse parachute on touchdown
+          const spec = AIRDROP_SPECS[a.kind];
+          addInteractable({
+            id: `airdrop-${a.pos.x.toFixed(1)}-${a.pos.z.toFixed(1)}`,
+            kind: 'airdrop',
+            pos: new THREE.Vector3(a.pos.x, 1, a.pos.z),
+            label: `Open ${spec.name}`,
+            readyAt: 0,
+            remove: () => {
+              onClaim?.(a);
+              this.openAirdrop(a, removeInteractable);
+            },
+          });
         }
       }
-      (a.beacon.material as THREE.MeshBasicMaterial).opacity = 0.16 + 0.12 * Math.abs(Math.sin(performance.now() * 0.003));
     }
   }
 
   private openAirdrop(a: Airdrop, removeInteractable: (id: string) => void): void {
     a.opened = true;
-    a.pod.visible = false; // shared materials: never disposed, just hidden
+    a.pod.visible = false;
     removeInteractable(`airdrop-${a.pos.x.toFixed(1)}-${a.pos.z.toFixed(1)}`);
   }
 

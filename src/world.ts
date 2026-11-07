@@ -122,6 +122,9 @@ export function buildWorld(scene: THREE.Scene): WorldBundle {
   });
   trunks.castShadow = true;
   cones.castShadow = true;
+  trunks.computeBoundingSphere();
+  cones.computeBoundingSphere();
+  caps.computeBoundingSphere();
   group.add(trunks, cones, caps);
 
   // Perimeter wire fence posts on the pad edge
@@ -133,7 +136,62 @@ export function buildWorld(scene: THREE.Scene): WorldBundle {
     m.makeTranslation(Math.cos(a) * 15.5, 0.7, Math.sin(a) * 15.5);
     posts.setMatrixAt(i, m);
   }
+  posts.computeBoundingSphere();
   group.add(posts);
+
+  // Alpine Guard Watchtower (NE perimeter)
+  const steelMat = new THREE.MeshStandardMaterial({ color: 0x2a3648, roughness: 0.5, metalness: 0.7 });
+  const tower = new THREE.Group();
+  for (const [lx, lz] of [[-1.3, -1.3], [1.3, -1.3], [-1.3, 1.3], [1.3, 1.3]]) {
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.18, 6.5, 6), steelMat);
+    leg.position.set(lx, 3.25, lz);
+    tower.add(leg);
+  }
+  const cab = new THREE.Mesh(new THREE.BoxGeometry(3.4, 2.2, 3.4), steelMat);
+  cab.position.y = 7.2;
+  cab.castShadow = true;
+  tower.add(cab);
+  const visor = new THREE.Mesh(
+    new THREE.BoxGeometry(3.52, 0.65, 3.52),
+    new THREE.MeshStandardMaterial({ color: 0x0b1522, emissive: new THREE.Color('#38bdf8'), emissiveIntensity: 0.7, roughness: 0.2 }),
+  );
+  visor.position.y = 7.35;
+  tower.add(visor);
+  const roof = new THREE.Mesh(new THREE.ConeGeometry(2.8, 1.2, 4), steelMat);
+  roof.position.y = 8.9;
+  roof.rotation.y = Math.PI / 4;
+  tower.add(roof);
+  tower.position.set(18, 0, -14);
+  group.add(tower);
+  addCollider(colliders, 'box', 18, -14, 1.8, 1.8, 8.5);
+
+  // Tracked Snowcat Radar Vehicle (SW perimeter)
+  const snowcat = new THREE.Group();
+  const hullMat = new THREE.MeshStandardMaterial({ color: 0xd97706, roughness: 0.45, metalness: 0.55 });
+  const trackMat = new THREE.MeshStandardMaterial({ color: 0x1a202c, roughness: 0.85, metalness: 0.4 });
+  for (const side of [-1, 1]) {
+    const tread = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.85, 4.4), trackMat);
+    tread.position.set(side * 1.35, 0.42, 0);
+    snowcat.add(tread);
+  }
+  const chas = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1.15, 4.0), hullMat);
+  chas.position.y = 1.25;
+  chas.castShadow = true;
+  snowcat.add(chas);
+  const windshield = new THREE.Mesh(
+    new THREE.BoxGeometry(2.3, 0.6, 0.12),
+    new THREE.MeshStandardMaterial({ color: 0x0f172a, emissive: new THREE.Color('#fef08a'), emissiveIntensity: 0.8 }),
+  );
+  windshield.position.set(0, 1.4, 2.01);
+  snowcat.add(windshield);
+  const dish = new THREE.Mesh(new THREE.CylinderGeometry(0.9, 0.2, 0.35, 12), steelMat);
+  dish.position.set(0, 2.2, -0.6);
+  dish.rotation.x = 0.4;
+  snowcat.add(dish);
+  snowcat.position.set(-16, 0, 14);
+  snowcat.rotation.y = 0.65;
+  group.add(snowcat);
+  addCollider(colliders, 'box', -16, 14, 2.2, 2.2, 2.4);
 
   return {
     group,
